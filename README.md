@@ -1,13 +1,3 @@
-## **Project Name: Averlock**
-
-### *Autonomy without losing human control.*
-
-I checked the naming landscape rather than just renaming Sentinel arbitrarily. **“Sentinel” is especially crowded in exactly this space**: there are already multiple AI-agent governance/security projects using the name, including systems that intercept agent actions, risk-score them, and route them to human review. ([GitHub][1])
-
-For **Averlock**, exact-name searches did not surface a notable AI-agent, field-operations, or governance product using the name; the visible matches were essentially unrelated. So it is substantially less crowded for a hackathon identity. This is a preliminary web-name check, not formal trademark clearance—WIPO recommends checking exact, similar, phonetic, and class-specific marks before commercial use. ([WIPO][2])
-
----
-
 # Averlock
 
 ### **An autonomous field-operations system that knows when to act, when to ask, and what happens when the human in charge cannot respond.**
