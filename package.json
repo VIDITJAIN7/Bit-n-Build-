@@ -1,0 +1,29 @@
+{
+  "name": "averlock",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/web",
+    "contracts"
+  ],
+  "scripts": {
+    "setup": "npm install && python scripts/setup.py",
+    "dev": "node scripts/dev.mjs",
+    "dev:web": "npm run dev --workspace @averlock/web",
+    "build": "npm run build --workspace @averlock/web",
+    "test": "python scripts/test_api.py && npm run test --workspace @averlock/contracts",
+    "test:api": "python scripts/test_api.py",
+    "test:contracts": "npm run test --workspace @averlock/contracts"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2"
+  },
+  "overrides": {
+    "solc": {
+      "tmp": "0.2.7"
+    }
+  }
+}
