@@ -1,6 +1,6 @@
 # Workkite
 
-**Workkite turns operational signals into clear, trackable work for teams in the field.** An administrator defines what should be monitored and what action may follow. The operations agent evaluates matching records, proposes or schedules work, and sends eligible actions through fixed policy checks. Workers complete their assigned tasks—even when offline—and submit a traceable report.
+**Workkite turns operational signals into clear, trackable work for teams in the field.** An administrator defines what should be monitored and what action may follow. The operations agent evaluates matching records, proposes or schedules work, and sends eligible actions through fixed policy checks. Workers complete their assigned tasks and submit a traceable report.
 
 Workkite is designed for organizations that operate across multiple sites and need routine work to move quickly without giving automation unchecked authority. Solar-farm examples are included, but tasks, conditions, actions, and report fields are workspace data, so the same workflow can be configured for other industries.
 
