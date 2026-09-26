@@ -81,6 +81,8 @@ flowchart LR
 
 ## Run locally
 
+For the complete step-by-step Windows and macOS/Linux setup, troubleshooting, and first sign-in instructions, see the [localhost installation guide](docs/local-installation.md).
+
 ### Requirements
 
 - Node.js 22.12 or newer and npm.
@@ -166,6 +168,7 @@ scripts/                      Setup, local run, tests, and build support
 
 ## More documentation
 
+- [Install and run on localhost](docs/local-installation.md)
 - [Architecture](docs/architecture.md)
 - [Product brief](docs/product-brief.md)
 - [Implementation decisions](docs/decisions.md)
