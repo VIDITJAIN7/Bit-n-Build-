@@ -50,7 +50,9 @@ def blank_workspace_state() -> dict:
         "owner": "unassigned",
         "receipts": [],
     }
-    state["agent"].update({"enabled": False, "live_feed": False})
+    # Empty workspaces have no executable tasks or funds. Keep the commander
+    # active by default so newly configured admin tasks are processed on schedule.
+    state["agent"].update({"enabled": True, "live_feed": False})
     state["weather"] = {
         "source": "unconfigured",
         "scenario": "unavailable",

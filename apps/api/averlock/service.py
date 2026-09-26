@@ -90,16 +90,16 @@ class OperationsService:
     # Background agent ---------------------------------------------------------------
 
     def cycle(self):
-        """One background pass: the optional sensor feed, then every enabled automatic trigger."""
+        """Run due plans, refresh data, then evaluate every enabled automatic task."""
         if not self.repository.read()["agent"]["enabled"]:
             return None, "The background agent is paused."
 
         def change(state):
             agent = state["agent"]
             refresh_daily_budget(state)
+            created = self._process_scheduled(state)
             if agent["live_feed"]:
                 self.feed.step(state)
-            created = 0
             for trigger in state["triggers"]:
                 if trigger["enabled"] and trigger["mode"] == "auto":
                     created += self._evaluate(state, trigger, manual=False)
@@ -161,10 +161,15 @@ class OperationsService:
             and a["subject"]["id"] == record_id
             for a in state["actions"]
         ) or any(
-            t["status"] == "open"
+            t["status"] in {"open", "scheduled"}
             and t.get("trigger_id") == trigger_id
             and t["subject_id"] == record_id
             for t in state["field_tasks"]
+        ) or any(
+            a["status"] == "scheduled"
+            and a.get("trigger_id") == trigger_id
+            and a["subject"]["id"] == record_id
+            for a in state["actions"]
         )
 
     def _admit(self, state, proposal, trigger=None):
@@ -179,11 +184,29 @@ class OperationsService:
             "field_confirmed": None,
             "receipt": None,
         }
+        delay = proposal.get("schedule_delay_minutes", 0)
+        if action["kind"] in {"work_order", "field_check"} and isinstance(delay, int) and not isinstance(delay, bool) and 0 < delay <= 10080:
+            action["scheduled_for"] = (recovery_now(state) + timedelta(minutes=delay)).isoformat()
+        else:
+            action["scheduled_for"] = None
         action["policy"] = evaluate(state, action)
-        action["status"] = "blocked" if action["policy"]["hard_blocks"] else "pending"
+        is_scheduled = bool(action["scheduled_for"])
+        action["status"] = (
+            "blocked" if action["policy"]["hard_blocks"]
+            else "scheduled" if is_scheduled
+            else "pending"
+        )
         state["actions"].append(action)
         record(state, "action.proposed", action["title"], "agent", action["id"])
-        outcome = "blocked" if action["status"] == "blocked" else "review"
+        outcome = "blocked" if action["status"] == "blocked" else "auto" if is_scheduled else "review"
+        if is_scheduled and action["status"] == "scheduled":
+            record(
+                state,
+                "action.scheduled",
+                f"{action['title']} — planned for {action['scheduled_for']}",
+                "agent",
+                action["id"],
+            )
         if outcome == "review" and action["policy"]["auto_allowed"]:
             try:
                 self.execute(state, action, autonomous=True)
@@ -203,6 +226,53 @@ class OperationsService:
         if state["drills"]["enabled"] and self.random.random() < state["drills"]["rate"]:
             self.add_canary(state)
         return action
+
+    def _process_scheduled(self, state):
+        """Recheck policy at the scheduled time before executing or requesting review."""
+        now = recovery_now(state)
+        processed = 0
+        for action in state["actions"]:
+            if action.get("status") != "scheduled" or not action.get("scheduled_for"):
+                continue
+            if datetime.fromisoformat(action["scheduled_for"]) > now:
+                continue
+            action["policy"] = evaluate(state, action)
+            if action["policy"]["hard_blocks"]:
+                action["status"] = "blocked"
+                state["stats"]["blocked"] += 1
+                record(
+                    state,
+                    "action.blocked",
+                    f"{action['title']} — {'; '.join(action['policy']['hard_blocks'])}",
+                    "policy",
+                    action["id"],
+                )
+            elif action["policy"]["auto_allowed"]:
+                action["status"] = "pending"
+                try:
+                    self.execute(state, action, autonomous=True)
+                except (DomainError, ValueError) as error:
+                    action["status"] = "blocked"
+                    action["policy"]["hard_blocks"].append(str(error))
+                    state["stats"]["blocked"] += 1
+                    record(state, "action.blocked", f"{action['title']} — {error}", "policy", action["id"])
+            else:
+                action["status"] = "pending"
+                record(
+                    state,
+                    "action.review_required",
+                    f"{action['title']} — policy now requires human review",
+                    "policy",
+                    action["id"],
+                )
+                trigger = next(
+                    (item for item in state["triggers"] if item["id"] == action.get("trigger_id")),
+                    None,
+                )
+                if trigger:
+                    trigger["runtime"]["stats"]["review"] += 1
+            processed += 1
+        return processed
 
     def execute(self, state, action, autonomous=False, actor="agent"):
         # Recheck at the moment of execution, inside the repository transaction.
@@ -290,7 +360,7 @@ class OperationsService:
             return [item for item in items if item["id"] not in dropped]
 
         state["actions"] = keep_latest(
-            state["actions"], MAX_ACTIONS, lambda a: a["status"] == "pending"
+            state["actions"], MAX_ACTIONS, lambda a: a["status"] in {"pending", "scheduled"}
         )
         state["field_tasks"] = keep_latest(
             state["field_tasks"], MAX_TASKS, lambda t: t["status"] == "open"
@@ -359,6 +429,15 @@ class OperationsService:
                 "operator",
             )
             return f"“{trigger['name']}” saved."
+
+        return self.repository.mutate(change)
+
+    def set_integrations(self, integrations):
+        """Persist admin-owned connector metadata; credential secrets stay in env vars."""
+        def change(state):
+            state["integrations"] = integrations
+            record(state, "integrations.updated", "Connector settings updated.", "operator")
+            return "Integration settings saved. Credentials are not stored here."
 
         return self.repository.mutate(change)
 
@@ -961,6 +1040,7 @@ class OperationsService:
 
     def snapshot(self):
         state = self.repository.read()
+        state.setdefault("integrations", initial_state()["integrations"])
         state["recovery"]["now"] = recovery_now(state).isoformat()
         silence = owner_silence(state)
         supervision = state["supervision"]

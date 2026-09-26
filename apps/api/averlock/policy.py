@@ -59,6 +59,8 @@ def evaluate(state, action):
             hard_blocks.append("Insufficient operating funds")
     if action.get("requires_field_check"):
         reasons.append("Physical confirmation required")
+    if action.get("force_review"):
+        reasons.append("AI commander requested human review")
     score = min(100, 8 + len(reasons) * 16 + len(hard_blocks) * 45)
     ai_risk = action.get("ai_risk") or {}
     ai_score = ai_risk.get("score", 0)

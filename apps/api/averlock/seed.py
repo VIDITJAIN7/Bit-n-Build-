@@ -2,7 +2,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 
 # Bump when the stored state shape changes; supported local states are migrated in place.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def now_iso():
@@ -412,6 +412,19 @@ def initial_state():
             "last_cycle_at": None,
             "last_cycle_changes": 0,
         },
+        "integrations": {
+            "telemetry": {"provider": "", "endpoint_url": "", "enabled": False},
+            "inventory": {"provider": "", "endpoint_url": "", "enabled": False},
+            "workforce": {"provider": "", "endpoint_url": "", "enabled": False},
+            "wallet": {
+                "provider": "",
+                "rpc_url": "",
+                "chain_id": "",
+                "contract_address": "",
+                "wallet_connect_project_id": "",
+                "enabled": False,
+            },
+        },
         "actions": [],
         "field_tasks": [],
         "reports": [],
@@ -480,6 +493,7 @@ def migrate_state(state):
         task.setdefault("assignee", "")
         task.setdefault("instructions", "")
         task.setdefault("priority", "normal")
+    state.setdefault("integrations", deepcopy(defaults["integrations"]))
     if state.get("workspace", {}).get("name") == "Averlock demo workspace":
         state["workspace"]["name"] = "Averlock operations workspace"
     state["schema_version"] = SCHEMA_VERSION

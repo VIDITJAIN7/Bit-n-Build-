@@ -1,4 +1,4 @@
-"""Vercel Python entry point for the existing FastAPI application."""
+"""Vercel FastAPI entry point for all /api/* routes."""
 
 import sys
 from pathlib import Path

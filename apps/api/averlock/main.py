@@ -10,9 +10,15 @@ from typing import Annotated, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
-from .adapters import AIReviewPlanner, LocalPlanner, OpenAICompatibleRiskReviewer
+from .adapters import (
+    AICommander,
+    AIReviewPlanner,
+    LocalPlanner,
+    OpenAICompatibleCommander,
+    OpenAICompatibleRiskReviewer,
+)
 from .production import PostgresRepository, bind_workspace, verify_supabase_request
 from .repository import SQLiteRepository
 from .service import DomainError, OperationsService
@@ -117,6 +123,47 @@ class LoginRequest(StrictModel):
 class AgentSettings(StrictModel):
     enabled: bool | None = None
     live_feed: bool | None = None
+
+
+class ConnectorSettings(StrictModel):
+    provider: str = Field(default="", max_length=80)
+    endpoint_url: str = Field(default="", max_length=500)
+    enabled: bool = False
+
+    @field_validator("endpoint_url")
+    @classmethod
+    def validate_endpoint(cls, value):
+        return validate_connector_url(value)
+
+
+class WalletConnectorSettings(StrictModel):
+    provider: str = Field(default="", max_length=80)
+    rpc_url: str = Field(default="", max_length=500)
+    chain_id: str = Field(default="", max_length=40)
+    contract_address: str = Field(default="", max_length=120)
+    wallet_connect_project_id: str = Field(default="", max_length=120)
+    enabled: bool = False
+
+    @field_validator("rpc_url")
+    @classmethod
+    def validate_rpc(cls, value):
+        return validate_connector_url(value)
+
+
+def validate_connector_url(value: str):
+    if value and not value.startswith(("https://", "http://")):
+        raise ValueError("Connector endpoints must use http:// or https://")
+    if "@" in value.split("//", 1)[-1].split("/", 1)[0]:
+        raise ValueError("Do not put credentials in a connector URL")
+    return value
+
+
+class IntegrationSettings(StrictModel):
+    telemetry: ConnectorSettings
+    inventory: ConnectorSettings
+    workforce: ConnectorSettings
+    wallet: WalletConnectorSettings
+
 
 
 class SiteInput(StrictModel):
@@ -225,7 +272,7 @@ def create_app(database_path=None, agent_interval=None):
     agent_mode = setting("WORKKITE_AGENT", "rules", "AVERLOCK_AGENT").strip().lower()
     if agent_mode in {"rules", "local"}:
         planner = LocalPlanner()
-    elif agent_mode in {"ai-risk", "openai-compatible"}:
+    elif agent_mode in {"ai-commander", "ai-risk", "openai-compatible"}:
         required = (
             ("WORKKITE_LLM_BASE_URL", "AVERLOCK_LLM_BASE_URL"),
             ("WORKKITE_LLM_MODEL", "AVERLOCK_LLM_MODEL"),
@@ -234,14 +281,27 @@ def create_app(database_path=None, agent_interval=None):
         missing = [name for name, legacy in required if not setting(name, "", legacy)]
         if missing:
             raise RuntimeError(f"AI agent requires configuration: {', '.join(missing)}")
-        reviewer = OpenAICompatibleRiskReviewer(
-            setting("WORKKITE_LLM_BASE_URL", legacy_name="AVERLOCK_LLM_BASE_URL"),
-            setting("WORKKITE_LLM_API_KEY", legacy_name="AVERLOCK_LLM_API_KEY"),
-            setting("WORKKITE_LLM_MODEL", legacy_name="AVERLOCK_LLM_MODEL"),
-        )
-        planner = AIReviewPlanner(reviewer)
+        base_url = setting("WORKKITE_LLM_BASE_URL", legacy_name="AVERLOCK_LLM_BASE_URL")
+        api_key = setting("WORKKITE_LLM_API_KEY", legacy_name="AVERLOCK_LLM_API_KEY")
+        model = setting("WORKKITE_LLM_MODEL", legacy_name="AVERLOCK_LLM_MODEL")
+        if agent_mode == "ai-risk":
+            # Backward-compatible mode: AI risk scoring added to the rules planner.
+            planner = AIReviewPlanner(OpenAICompatibleRiskReviewer(base_url, api_key, model))
+        else:
+            planner = AICommander(OpenAICompatibleCommander(base_url, api_key, model))
     else:
-        raise RuntimeError("WORKKITE_AGENT must be 'rules' or 'ai-risk'.")
+        raise RuntimeError("WORKKITE_AGENT must be 'rules' or 'ai-commander'.")
+
+    risk_mode = setting("WORKKITE_RISK_REVIEWER", "off").strip().lower()
+    if risk_mode == "ai" and agent_mode != "ai-risk":
+        base_url = setting("WORKKITE_LLM_BASE_URL", legacy_name="AVERLOCK_LLM_BASE_URL")
+        api_key = setting("WORKKITE_LLM_API_KEY", legacy_name="AVERLOCK_LLM_API_KEY")
+        model = setting("WORKKITE_LLM_MODEL", legacy_name="AVERLOCK_LLM_MODEL")
+        if not (base_url and api_key and model):
+            raise RuntimeError("AI risk review requires WORKKITE_LLM_BASE_URL, WORKKITE_LLM_MODEL, and WORKKITE_LLM_API_KEY.")
+        planner = AIReviewPlanner(OpenAICompatibleRiskReviewer(base_url, api_key, model), planner)
+    elif risk_mode not in {"off", "", "ai"}:
+        raise RuntimeError("WORKKITE_RISK_REVIEWER must be 'off' or 'ai'.")
     if setting("WORKKITE_WALLET", "local", "AVERLOCK_WALLET") not in {"local", "simulated"}:
         raise RuntimeError("External wallet adapter is not configured.")
     interval = (
@@ -363,6 +423,7 @@ def create_app(database_path=None, agent_interval=None):
             snapshot["inventory"] = []
             snapshot["suppliers"] = []
             snapshot["wallet"] = {"balance_cents": 0, "receipts": [], "mode": "hidden"}
+            snapshot["integrations"] = {}
             snapshot["audit"] = []
         return snapshot
 
@@ -438,6 +499,10 @@ def create_app(database_path=None, agent_interval=None):
     @app.post("/api/agent")
     def agent_settings(body: AgentSettings):
         return command(lambda: service.set_agent(body.enabled, body.live_feed))
+
+    @app.put("/api/integrations")
+    def integrations(body: IntegrationSettings):
+        return command(lambda: service.set_integrations(body.model_dump()))
 
     @app.post("/api/agent/cycle")
     def agent_cycle():

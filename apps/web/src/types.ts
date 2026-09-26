@@ -37,7 +37,7 @@ export type Action = {
   sku?: string;
   quantity?: number;
   explanation: string;
-  status: "pending" | "executed" | "rejected" | "blocked" | "drill_resolved";
+  status: "pending" | "scheduled" | "executed" | "rejected" | "blocked" | "drill_resolved";
   drill_result?: "caught" | "missed";
   canary_expected?: string;
   policy: PolicyResult;
@@ -48,6 +48,8 @@ export type Action = {
   field_confirmed: boolean | null;
   verification_requested: boolean;
   created_at: string;
+  scheduled_for?: string | null;
+  agent_decision?: { handling: string; reason: string };
   execution_mode?: "autonomous" | "human";
   executed_at?: string;
   receipt: Receipt | null;
@@ -223,6 +225,19 @@ export type Preview = {
 };
 export type State = {
   workspace: { name: string };
+  integrations: {
+    telemetry: { provider: string; endpoint_url: string; enabled: boolean };
+    inventory: { provider: string; endpoint_url: string; enabled: boolean };
+    workforce: { provider: string; endpoint_url: string; enabled: boolean };
+    wallet: {
+      provider: string;
+      rpc_url: string;
+      chain_id: string;
+      contract_address: string;
+      wallet_connect_project_id: string;
+      enabled: boolean;
+    };
+  };
   sites: Site[];
   assets: Asset[];
   inventory: InventoryItem[];
@@ -248,7 +263,7 @@ export type State = {
     last_cycle_at: string | null;
     last_cycle_changes: number;
     interval_seconds: number;
-    planner: "rules" | "ai-risk";
+    planner: string;
   };
   wallet: {
     balance_cents: number;
@@ -308,4 +323,5 @@ export type Page =
   | "review"
   | "field"
   | "recovery"
-  | "audit";
+  | "audit"
+  | "integrations";

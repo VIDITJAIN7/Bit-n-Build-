@@ -8,6 +8,7 @@ import {
   LogOut,
   MapPin,
   Menu,
+  Plug,
   Radio,
   ShieldCheck,
   Workflow,
@@ -41,6 +42,7 @@ import { Field } from "./components/Field";
 import { Recovery } from "./components/Recovery";
 import { Audit } from "./components/Audit";
 import { SitePicker } from "./components/SitePicker";
+import { Integrations } from "./components/Integrations";
 
 const pages = [
   { id: "control", label: "Overview", icon: LayoutGrid },
@@ -50,6 +52,7 @@ const pages = [
   { id: "field", label: "Field", icon: MapPin },
   { id: "recovery", label: "Access", icon: ShieldCheck },
   { id: "audit", label: "Activity", icon: Activity },
+  { id: "integrations", label: "Connections", icon: Plug },
 ] as const;
 const POLL_MS = 4000;
 const ROLE_KEY = "workkite-role";
@@ -670,6 +673,9 @@ export default function App() {
                     />
                   )}
                   {page === "audit" && <Audit state={state} />}
+                  {page === "integrations" && (
+                    <Integrations state={state} command={command} busy={busy || offline} />
+                  )}
                 </>
               )}
             </>

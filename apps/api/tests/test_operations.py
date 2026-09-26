@@ -5,7 +5,7 @@ import time
 from copy import deepcopy
 
 import pytest
-from averlock.adapters import AIReviewPlanner, SimulatedFeed, SimulatedWallet
+from averlock.adapters import AICommander, AIReviewPlanner, LocalPlanner, SimulatedFeed, SimulatedWallet
 from averlock.main import create_app
 from averlock.policy import evaluate
 from averlock.production import blank_workspace_state
@@ -113,10 +113,99 @@ def test_production_api_requires_verified_membership_and_restricts_workers(monke
         response = hosted.get("/api/state", headers={"Authorization": "Bearer valid-worker-token"})
         assert response.status_code == 200, response.text
         assert response.json()["wallet"]["mode"] == "hidden"
+        assert response.json()["integrations"] == {}
         denied = hosted.post(
             "/api/triggers", headers={"Authorization": "Bearer valid-worker-token"}
         )
         assert denied.status_code == 403
+        assert hosted.put(
+            "/api/integrations",
+            headers={"Authorization": "Bearer valid-worker-token"},
+            json={},
+        ).status_code == 403
+
+
+def test_admin_can_save_blank_connector_settings_and_credentials_stay_out_of_state(client):
+    settings = {
+        "telemetry": {"provider": "", "endpoint_url": "", "enabled": False},
+        "inventory": {"provider": "", "endpoint_url": "", "enabled": False},
+        "workforce": {"provider": "", "endpoint_url": "", "enabled": False},
+        "wallet": {
+            "provider": "", "rpc_url": "", "chain_id": "", "contract_address": "",
+            "wallet_connect_project_id": "", "enabled": False,
+        },
+    }
+    result = client.put("/api/integrations", json=settings)
+    assert result.status_code == 200, result.text
+    assert result.json()["state"]["integrations"] == settings
+    assert "Credentials are not stored" in result.json()["message"]
+    unsafe = {**settings, "telemetry": {"provider": "x", "endpoint_url": "ftp://host", "enabled": True}}
+    assert client.put("/api/integrations", json=unsafe).status_code == 422
+    assert blank_workspace_state()["agent"]["enabled"] is True
+
+
+def test_ai_commander_can_schedule_field_work_but_not_change_candidate_or_payee():
+    class FixedCommander:
+        def decide(self, context):
+            assert "recipient" not in str(context)
+            return {
+                "handling": "schedule", "schedule_delay_minutes": 20,
+                "priority": "high", "assignee": "Alex Rivera", "reason": "Align with site visit.",
+            }
+
+    state = initial_state()
+    trigger = next(item for item in state["triggers"] if item["id"] == "trg-overheat")
+    row = next(item for item in state["assets"] if item["id"] == "inv-07")
+    proposal = AICommander(FixedCommander()).propose(
+        {"state": state, "trigger": trigger, "record": row}
+    )[0]
+    assert proposal["kind"] == "work_order"
+    assert proposal["schedule_delay_minutes"] == 20
+    assert proposal["assignee"] == "Alex Rivera"
+    assert proposal["priority"] == "high"
+    assert proposal["agent_decision"]["handling"] == "schedule"
+
+
+def test_ai_commander_failure_requires_review_instead_of_autonomous_fallback():
+    class UnavailableCommander:
+        def decide(self, _context):
+            raise TimeoutError("provider unavailable")
+
+    state = initial_state()
+    trigger = next(item for item in state["triggers"] if item["id"] == "trg-overheat")
+    row = next(item for item in state["assets"] if item["id"] == "inv-07")
+    proposal = AICommander(UnavailableCommander()).propose(
+        {"state": state, "trigger": trigger, "record": row}
+    )[0]
+    assert proposal["force_review"] is True
+    assert proposal["agent_decision"]["handling"] == "human_review"
+
+
+def test_scheduled_field_work_is_rechecked_then_dispatched(client):
+    service = client.app.state.service
+
+    class SchedulingPlanner:
+        mode = "test-commander"
+
+        def propose(self, context):
+            return [
+                {**item, "schedule_delay_minutes": 2}
+                for item in LocalPlanner().propose(context)
+            ]
+
+    service.agent = SchedulingPlanner()
+    scheduled = cycle(client)
+    work = next(a for a in scheduled["actions"] if a["kind"] == "work_order")
+    assert work["status"] == "scheduled"
+    service.repository.mutate(
+        lambda state: next(a for a in state["actions"] if a["id"] == work["id"]).update(
+            scheduled_for="2000-01-01T00:00:00+00:00"
+        )
+    )
+    due = cycle(client)
+    completed = next(a for a in due["actions"] if a["id"] == work["id"])
+    assert completed["status"] == "executed"
+    assert any(task["action_id"] == work["id"] and task["status"] == "open" for task in due["field_tasks"])
 
 
 def post(client, path, body=None, status=200, method="post"):
