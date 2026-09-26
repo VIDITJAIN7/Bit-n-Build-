@@ -76,12 +76,12 @@ flowchart LR
 ## Current capabilities and boundaries
 
 - **Included:** React/Vite interface, FastAPI API, editable task rules, worker reports with local offline queue, local SQLite development, Supabase Auth/Postgres hosted adapter, replaceable OpenAI-compatible AI provider, and policy-checked action proposals.
-- **AI is optional:** the default rules planner works without an API key. Configure a server-side key to use an AI commander. Never expose provider keys in browser variables such as `VITE_*` or commit them.
-- **External connections are extension points:** telemetry/SCADA, inventory/procurement, workforce dispatch, weather, notifications, and RPC settings do not activate vendor integrations until their adapters are implemented and configured.
-- **Wallet status:** a Solidity reference contract and tests are included, but it is not deployed or connected to the UI. The app does not send real blockchain transactions.
-- **Evidence storage:** hosted report metadata and media are currently stored through Postgres. A private Supabase Storage bucket exists, but direct browser uploads are not wired yet; avoid relying on large photo/audio uploads at scale.
+- **AI is operational:** the AI planner requires an API key. Configure a server-side key to use an AI commander. Never expose provider keys in browser variables such as `VITE_*` or commit them.
+- **External connections are extension points:** telemetry/SCADA, inventory/procurement, workforce dispatch, weather, notifications, and RPC settings do not activate vendor integrations until their adapters are implemented and configured by the admin according to needs.
+- **Wallet status:** a Solidity reference contract and tests are included, but it is not deployed right now.
+- **Storage:** A private Supabase Storage bucket exists, but direct browser uploads are not wired yet.
 
-## Run locally
+## Run locally (AI Connection Optional)
 
 For the complete step-by-step Windows and macOS/Linux setup, troubleshooting, and first sign-in instructions, see the [localhost installation guide](docs/local-installation.md).
 
