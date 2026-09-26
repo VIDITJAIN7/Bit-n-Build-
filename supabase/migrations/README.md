@@ -6,6 +6,7 @@ The applied migration sequence matches the Supabase project history:
 - `20260926132819_invited_workspace_members.sql` assigns the first *invited* Auth account as administrator; later invited accounts start as workers. Open self-sign-ups do not receive workspace access.
 - `20260926132908_tighten_workspace_permissions.sql` limits state writes to administrators.
 - `20260926132938_revoke_public_rls_helper.sql` removes public execution rights from the RLS helper.
+- `20260926143700_handle_auth_invited_at_update.sql` handles Auth invites that set `invited_at` in a follow-up update and backfills already invited users.
 
 The application keeps its SQLite adapter for development and selects Postgres only when `WORKKITE_ENV=production`.
 
