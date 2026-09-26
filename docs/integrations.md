@@ -4,13 +4,15 @@ No connectors, accounts, RPC subscriptions, API keys, or testnet funds are neede
 
 ## Planner / LLM
 
-Implement the `Agent.propose(context)` protocol in `apps/api/averlock/adapters.py` and inject it into `OperationsService`. Gemini, OpenAI, or another provider can be used without changing the policy gate or frontend. Return structured proposals with the same fields as `LocalPlanner`; validate provider output before using it. A provider is never given a supervisor key or allowed to call the wallet directly.
+Implement the `Agent.propose(context)` protocol in `apps/api/averlock/adapters.py` and inject it into `OperationsService`. `context` contains the workspace `state`, the operator `trigger` that fired, and the matched `record` row. Return a list of structured proposals with the same fields as `LocalPlanner` (kind, title, amount, supplier, recipient, subject, explanation, optional field-check question). Gemini, OpenAI, Claude, or another provider can be used without changing the trigger engine, policy gate, or frontend; validate provider output before using it. A provider is never given a supervisor key or allowed to call the wallet directly, and whatever it proposes still crosses the same policy gate.
 
 The current planner is deterministic and is labeled that way. Do not relabel it as an LLM until the adapter actually calls a model. Environment selection deliberately fails for unsupported adapters instead of silently pretending a connection exists.
 
-## Site data
+## Site data and telemetry
 
-Implement `SiteSource.snapshot(state)` to return trusted equipment, inventory, maintenance, and supplier records. Separate authoritative supplier and recipient records from model-generated content. In a production integration, reconcile quotes, quantities, live prices, and supplier identifiers before autonomous execution; the local fixture intentionally supports one incident.
+Operators maintain sites, assets, inventory, and suppliers through `/api/data/{collection}` (create, `PATCH`, delete). A connector can use the same routes, or write through the repository, to keep records current. The trigger builder infers fields from the records, so a new reading (for example `vibration_rms`) becomes available to triggers without code changes. Separate authoritative supplier and recipient records from model-generated content, and reconcile quotes, quantities, live prices, and supplier identifiers before autonomous execution.
+
+Live telemetry belongs behind the `Feed.step(state)` port. `SimulatedFeed` drifts readings and consumes stock for demos; a real feed would apply the latest verified readings with timestamps and freshness checks. The background agent evaluates triggers after each feed step.
 
 ## Weather
 
@@ -20,15 +22,15 @@ When adding a weather provider, compute or use its heat-index value with units a
 
 ## Database / files
 
-Implement the `Repository.read()` / `Repository.mutate(change)` contract for Postgres or Supabase. The mutation contract is atomic: authorization, balance, budget, receipt, and audit updates either all commit or all roll back. Use row locking or serializable transactions to preserve those guarantees.
+Implement the `Repository` contract for Postgres or Supabase: `read()`, `mutate(change, blobs)`, `blob(id)`, and `clear_blobs()`. The mutation contract is atomic: authorization, balance, budget, receipt, evidence media, and audit updates either all commit or all roll back. Use row locking or serializable transactions to preserve those guarantees; the background agent and human commands write concurrently.
 
-Media can move from inline demo data to object storage. Keep the report UUID and idempotency semantics. Firebase could supply authenticated data and storage if the hackathon requires a Google stack; that requirement has not been assumed. Do not store service credentials in the browser.
+Evidence media already lives outside the state document; move it to authenticated object storage and keep the report UUID, SHA-256 fingerprints, and idempotency semantics. Firebase could supply authenticated data and storage if the hackathon requires a Google stack; that requirement has not been assumed. Do not store service credentials in the browser.
 
 ## Identity and signed decisions
 
-The local `actor` field is a simulation control, not authentication. Before exposing the API, replace it with a verified identity derived from a session/JWT or a wallet signature. Bind authorization to action ID, amount, destination, evidence digest, nonce, chain ID, and expiration. Re-read current policy and signer authority when executing. Only verified **primary-human** activity should update the primary availability clock.
+The local `actor` field is a simulation control, not authentication. Before exposing the API, replace it with a verified identity derived from a session/JWT or a wallet signature. Bind authorization to action ID, amount, destination, evidence digest, nonce, chain ID, and expiration. Re-read current policy and signer authority when executing. Only verified **primary-human** activity should update the primary availability clock. Trigger and data edits should also require an authenticated operator role, since they steer what the agent proposes.
 
-The verifier must distinguish primary supervisor, backup, agent, technician, and guardians. Agent activity and backups must never keep an absent primary supervisor looking active. Remove demo reset/time/role-selection routes from production configuration.
+The verifier must distinguish primary supervisor, backup, agent, operator, technician, and guardians. Agent activity and backups must never keep an absent primary supervisor looking active. Remove demo reset/time/role-selection routes and the simulated feed from production configuration.
 
 ## Blockchain
 
@@ -42,10 +44,11 @@ The contract does not verify off-chain field evidence or enforce canary training
 
 ## Suggested integration order
 
-1. Verified human identity and role enforcement.
+1. Verified human identity and role enforcement, including operator roles for triggers and data.
 2. Real database and object storage with matching atomic/idempotent semantics.
-3. LLM planner behind the existing gate.
-4. Weather and site feeds with freshness checks.
-5. Testnet wallet connector and transaction outbox.
+3. Telemetry feeds with freshness checks behind the `Feed` port.
+4. LLM planner behind the existing gate.
+5. Weather feed.
+6. Testnet wallet connector and transaction outbox.
 
-No plugin installation by itself completes these integrations. The current application needs no Codex app connector.
+No plugin installation by itself completes these integrations. The current application needs no app connector.

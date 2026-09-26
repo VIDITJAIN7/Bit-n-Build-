@@ -8,17 +8,19 @@ import {
   UserRound,
   X,
 } from "lucide-react";
-import { money } from "../api";
+import { mediaUrl, money } from "../api";
 import type { State, Command, Page } from "../types";
 import { HoldButton } from "./HoldButton";
 
 export function Review({
   state,
+  siteFilter,
   command,
   busy,
   go,
 }: {
   state: State;
+  siteFilter: string;
   command: Command;
   busy: boolean;
   go: (page: Page) => void;
@@ -33,7 +35,13 @@ export function Review({
     missed: 0,
     enhanced: false,
   };
-  const pending = state.actions.filter((a) => a.status === "pending");
+  const siteName = (id: string) =>
+    state.sites.find((site) => site.id === id)?.name ?? "Unknown site";
+  const pending = state.actions.filter(
+    (a) =>
+      a.status === "pending" &&
+      (siteFilter === "all" || a.site_id === siteFilter),
+  );
   const displayed = pending.filter(
     (a) => filter === "all" || a.policy.level === "high",
   );
@@ -160,12 +168,11 @@ export function Review({
           <ShieldCheck size={36} />
           <h2>No decisions waiting.</h2>
           <p>
-            {state.scenario_ran
-              ? "Every reviewed action has been recorded in the audit trail."
-              : "Run the site agent from Overview to generate the demo actions."}
+            The background agent routes only exceptions here. Everything it
+            handled within policy is in the activity log.
           </p>
-          <button className="button secondary" onClick={() => go("overview")}>
-            Back to overview
+          <button className="button secondary" onClick={() => go("control")}>
+            Back to control panel
           </button>
         </div>
       )}
@@ -174,7 +181,12 @@ export function Review({
           .sort((a, b) => b.amount_cents - a.amount_cents)
           .map((action) => {
             const needsEvidence =
-              action.requires_field && action.field_fault !== true;
+              action.requires_field_check && action.field_confirmed !== true;
+            const task = [...state.field_tasks]
+              .reverse()
+              .find((t) => t.action_id === action.id);
+            const question =
+              task?.question || action.field_question || "Confirm on site";
             const alreadySigned = action.approvals.includes(actor);
             const wrongFirst =
               role === "backup" && !state.supervision.backup_active;
@@ -191,7 +203,14 @@ export function Review({
                 <div className="review-title">
                   <div>
                     <h2>{action.title}</h2>
-                    <p>{action.supplier} · Desert Ridge, Site 07</p>
+                    <p>
+                      {action.supplier ?? action.subject.label} ·{" "}
+                      {siteName(action.site_id)}
+                    </p>
+                    <p className="provenance">
+                      Raised by trigger “{action.trigger_name}” ·{" "}
+                      {action.subject.code}
+                    </p>
                   </div>
                   <strong>
                     {money(action.amount_cents)}
@@ -219,30 +238,37 @@ export function Review({
                     </div>
                   </div>
                 </div>
-                {action.requires_field && (
+                {action.requires_field_check && (
                   <div
-                    className={`evidence-box ${action.field_fault === true ? "verified" : ""}`}
+                    className={`evidence-box ${action.field_confirmed === true ? "verified" : ""}`}
                   >
                     <ClipboardCheck size={21} />
                     <div>
                       <strong>
-                        {action.field_fault === true
-                          ? "Field fault confirmed"
-                          : action.field_fault === false
-                            ? "Technician reports no visible fault"
-                            : action.verification_requested
+                        {action.field_confirmed === true
+                          ? "Confirmed on site"
+                          : action.field_confirmed === false
+                            ? "Technician could not confirm"
+                            : task?.status === "open"
                               ? "Waiting for field evidence"
                               : "A physical check comes first"}
                       </strong>
                       <small>
-                        {action.field_fault === true
+                        {action.field_confirmed === true
                           ? "Evidence received by the local server. Human authorization is still required."
-                          : action.field_fault === false
-                            ? "Approval stays blocked. Reinspect and submit new evidence if conditions change."
-                            : "Ask the technician to check the red fault indicator on Inverter 04."}
+                          : action.field_confirmed === false
+                            ? "Approval stays blocked. Request another check if conditions change."
+                            : `The technician will be asked: “${question}”`}
                       </small>
                     </div>
-                    {!action.verification_requested ? (
+                    {task?.status === "open" ? (
+                      <button
+                        className="link-button"
+                        onClick={() => go("field")}
+                      >
+                        Open field console <ArrowRight size={15} />
+                      </button>
+                    ) : action.field_confirmed !== true ? (
                       <button
                         disabled={busy}
                         className="button secondary"
@@ -250,16 +276,12 @@ export function Review({
                           command(`/actions/${action.id}/verification`)
                         }
                       >
-                        Request verification <ArrowRight size={15} />
+                        {action.field_confirmed === false
+                          ? "Request another check"
+                          : "Request verification"}{" "}
+                        <ArrowRight size={15} />
                       </button>
-                    ) : (
-                      <button
-                        className="link-button"
-                        onClick={() => go("field")}
-                      >
-                        Open field console <ArrowRight size={15} />
-                      </button>
-                    )}
+                    ) : null}
                   </div>
                 )}
                 {state.reports
@@ -276,11 +298,12 @@ export function Review({
                       </summary>
                       <div className="technician-evidence">
                         <strong>
-                          {report.asset_id} ·{" "}
-                          {report.fault
-                            ? "Fault observed"
-                            : "No fault observed"}
+                          {report.asset_code} ·{" "}
+                          {report.answer
+                            ? "Yes, confirmed"
+                            : "No, not observed"}
                         </strong>
+                        <p>{question}</p>
                         <p>{report.note || "No additional text note."}</p>
                         <p>
                           Equipment matched · Work area checked · Protective
@@ -296,11 +319,16 @@ export function Review({
                             </small>
                             {attachment.kind === "photo" ? (
                               <img
-                                src={attachment.data_url}
+                                src={mediaUrl(report.id, "photo")}
                                 alt="Technician equipment evidence"
+                                loading="lazy"
                               />
                             ) : (
-                              <audio src={attachment.data_url} controls />
+                              <audio
+                                src={mediaUrl(report.id, "audio")}
+                                controls
+                                preload="none"
+                              />
                             )}
                           </div>
                         ))}
@@ -416,9 +444,10 @@ export function Review({
                 : "Mismatch missed"}
             </strong>
             <p>
-              The destination vend0r-a was a lookalike of vendor-a. This request
-              could never execute. Two successfully rejected drills restore
-              standard friction after a miss.
+              The destination {a.recipient} was a lookalike of{" "}
+              {a.canary_expected}. This request could never execute. Two
+              successfully rejected drills restore standard friction after a
+              miss.
             </p>
           </div>
         ))}

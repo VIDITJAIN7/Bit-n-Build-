@@ -2,6 +2,12 @@
 
 from .seed import now_iso
 
+KINDS = ("purchase", "work_order", "field_check", "notify")
+
+
+def money(cents):
+    return f"${cents / 100:,.0f}" if cents % 100 == 0 else f"${cents / 100:,.2f}"
+
 
 def refresh_daily_budget(state):
     day = now_iso()[:10]
@@ -16,16 +22,19 @@ def evaluate(state, action):
     reasons = []
     hard_blocks = []
     if (
-        action["kind"] not in ("purchase", "work_order")
+        action["kind"] not in KINDS
+        or isinstance(amount, bool)
         or not isinstance(amount, int)
         or amount < 0
     ):
         hard_blocks.append("Unsupported action or invalid amount")
+    elif action["kind"] != "purchase" and amount:
+        hard_blocks.append("Only purchases can move funds")
     if not action.get("evidence"):
         reasons.append("Operational evidence is missing")
-    if action["kind"] == "purchase":
+    if action["kind"] == "purchase" and not hard_blocks:
         supplier = next(
-            (s for s in state["suppliers"] if s["name"] == action.get("supplier")), None
+            (s for s in state["suppliers"] if s["id"] == action.get("supplier_id")), None
         )
         if not supplier or not supplier["approved"]:
             reasons.append("Supplier has not been approved")
@@ -34,15 +43,20 @@ def evaluate(state, action):
         elif supplier and action.get("recipient") != supplier["recipient"]:
             reasons.append("Payment destination does not match the supplier record")
         if amount > policy["agent_per_action_cents"]:
-            reasons.append("Above the $250 autonomous transaction limit")
+            limit = money(policy["agent_per_action_cents"])
+            reasons.append(f"Above the {limit} autonomous transaction limit")
         if state["wallet"]["agent_spent_cents"] + amount > policy["agent_daily_cents"]:
             reasons.append("Exceeds the remaining autonomous daily budget")
+        typical = policy.get("typical_purchase_cents")
+        if typical and amount >= 3 * typical:
+            reasons.append(f"Purchase is {amount / typical:.1f}× larger than typical site purchases")
         if amount > policy["supervisor_limit_cents"]:
-            hard_blocks.append("Above the operating wallet's $5,000 transaction limit")
+            limit = money(policy["supervisor_limit_cents"])
+            hard_blocks.append(f"Above the operating wallet's {limit} transaction limit")
         if amount > state["wallet"]["balance_cents"]:
             hard_blocks.append("Insufficient operating funds")
-    if action.get("requires_field") or action.get("sku") == "INV4":
-        reasons.append("Physical fault confirmation required")
+    if action.get("requires_field_check"):
+        reasons.append("Physical confirmation required")
     score = min(100, 8 + len(reasons) * 16 + len(hard_blocks) * 45)
     level = (
         "high"

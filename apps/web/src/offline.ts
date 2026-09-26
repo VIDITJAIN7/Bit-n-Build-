@@ -2,18 +2,22 @@ import { get, set, update, del } from "idb-keyval";
 import type { State, LocalReport, FieldReport } from "./types";
 import { request } from "./api";
 
-const REPORTS = "averlock-reports-v1";
-const SNAPSHOT = "averlock-snapshot-v1";
+// v2: reports answer generic field tasks instead of one hard-coded inverter check.
+const REPORTS = "averlock-reports-v2";
+const SNAPSHOT = "averlock-snapshot-v2";
 export const cachedState = () => get<State>(SNAPSHOT);
 export const cacheState = (state: State) => set(SNAPSHOT, state);
 export async function listReports(): Promise<LocalReport[]> {
   return (await get<LocalReport[]>(REPORTS)) || [];
 }
-export async function enqueue(report: FieldReport) {
+export async function enqueue(
+  report: FieldReport,
+  context: Pick<LocalReport, "subject_label" | "question">,
+) {
   // Resolve only after IndexedDB commits, before displaying SAVED.
   await update<LocalReport[]>(REPORTS, (reports) => [
     ...(reports || []),
-    { ...report, sync: "pending" },
+    { ...report, ...context, sync: "pending" },
   ]);
 }
 export async function clearLocalData() {
@@ -27,11 +31,11 @@ export function syncReports(): Promise<void> {
       if (local.sync === "confirmed") continue;
       const report: FieldReport = {
         id: local.id,
-        action_id: local.action_id,
-        fault: local.fault,
+        task_id: local.task_id,
+        answer: local.answer,
         note: local.note,
         created_at: local.created_at,
-        asset_id: local.asset_id,
+        asset_code: local.asset_code,
         checklist: local.checklist,
         attachments: local.attachments,
       };

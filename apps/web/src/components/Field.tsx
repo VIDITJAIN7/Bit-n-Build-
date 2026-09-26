@@ -25,6 +25,7 @@ import type {
   Command,
 } from "../types";
 import { time } from "../api";
+import { fieldFor, formatValue } from "../rules";
 import { HoldButton } from "./HoldButton";
 
 const emptyChecklist: Checklist = {
@@ -40,7 +41,7 @@ function asDataURL(blob: Blob): Promise<string> {
     reader.readAsDataURL(blob);
   });
 }
-function samplePhoto(): Attachment {
+function samplePhoto(code: string): Attachment {
   const canvas = document.createElement("canvas");
   canvas.width = 700;
   canvas.height = 450;
@@ -58,14 +59,14 @@ function samplePhoto(): Attachment {
   ctx.fillRect(270, 120, 135, 70);
   ctx.fillStyle = "#becfa0";
   ctx.font = "20px monospace";
-  ctx.fillText("FAULT 04", 280, 162);
+  ctx.fillText("STATUS", 280, 162);
   ctx.fillStyle = "#ad3830";
   ctx.beginPath();
   ctx.arc(290, 233, 14, 0, Math.PI * 2);
   ctx.fill();
   ctx.fillStyle = "#69775c";
   ctx.font = "19px monospace";
-  ctx.fillText("INV-04", 280, 97);
+  ctx.fillText(code, 270, 97);
   for (let i = 0; i < 5; i++) {
     ctx.fillRect(270, 275 + i * 10, 135, 3);
   }
@@ -82,6 +83,7 @@ function samplePhoto(): Attachment {
 
 export function Field({
   state,
+  siteFilter,
   reports,
   offline,
   simulatedOffline,
@@ -92,11 +94,15 @@ export function Field({
   command,
 }: {
   state: State;
+  siteFilter: string;
   reports: LocalReport[];
   offline: boolean;
   simulatedOffline: boolean;
   setSimulatedOffline: (value: boolean) => void;
-  onSave: (report: FieldReport) => Promise<boolean>;
+  onSave: (
+    report: FieldReport,
+    context: Pick<LocalReport, "subject_label" | "question">,
+  ) => Promise<boolean>;
   onSync: () => Promise<void>;
   busy: boolean;
   command: Command;
@@ -111,6 +117,7 @@ export function Field({
   const [asset, setAsset] = useState("");
   const [error, setError] = useState("");
   const [recording, setRecording] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const media = useRef<MediaRecorder | null>(null);
   const stream = useRef<MediaStream | null>(null);
   const timeout = useRef<number | null>(null);
@@ -123,14 +130,39 @@ export function Field({
     [],
   );
   const hot = state.weather.high_heat;
-  const task = state.actions.find(
-    (a) => a.verification_requested && a.status === "pending",
+  // Tasks answered on this device but not yet synced stay out of the queue.
+  const answeredLocally = new Set(
+    reports.filter((r) => r.sync !== "confirmed").map((r) => r.task_id),
   );
+  const tasks = state.field_tasks.filter(
+    (t) =>
+      t.status === "open" &&
+      !answeredLocally.has(t.id) &&
+      (siteFilter === "all" || t.site_id === siteFilter),
+  );
+  const task = tasks.find((t) => t.id === selectedId) ?? tasks[0];
+  const code = task?.subject_code ?? "";
+  const site = state.sites.find((s) => s.id === task?.site_id);
+  const subject = state.assets.find((a) => a.id === task?.subject_id);
   const valid =
     fault !== null &&
     Object.values(checklist).every(Boolean) &&
     attachments.some((a) => a.kind === "photo") &&
-    (!hot || asset.trim().toUpperCase() === "INV-04");
+    (!hot || asset.trim().toUpperCase() === code.toUpperCase());
+  function reset() {
+    setFault(null);
+    setNote("");
+    setChecklist({ ...emptyChecklist });
+    setAttachments([]);
+    setAsset("");
+    setError("");
+  }
+  function choose(id: string) {
+    if (id === task?.id) return;
+    setSelectedId(id);
+    setSaved(false);
+    reset();
+  }
   function add(attachment: Attachment) {
     setAttachments((old) => [
       ...old.filter((a) => a.kind !== attachment.kind),
@@ -227,23 +259,23 @@ export function Field({
   async function save() {
     if (!task || !valid || fault === null || saving) return;
     setSaving(true);
-    const success = await onSave({
-      id: crypto.randomUUID(),
-      action_id: task.id,
-      fault,
-      note: note.trim(),
-      created_at: new Date().toISOString(),
-      asset_id: hot ? asset.trim().toUpperCase() : "INV-04",
-      checklist,
-      attachments,
-    });
+    const success = await onSave(
+      {
+        id: crypto.randomUUID(),
+        task_id: task.id,
+        answer: fault,
+        note: note.trim(),
+        created_at: new Date().toISOString(),
+        asset_code: hot ? asset.trim().toUpperCase() : code,
+        checklist,
+        attachments,
+      },
+      { subject_label: task.subject_label, question: task.question },
+    );
     if (success) {
       setSaved(true);
-      setFault(null);
-      setNote("");
-      setChecklist({ ...emptyChecklist });
-      setAttachments([]);
-      setAsset("");
+      setSelectedId(null);
+      reset();
     }
     setSaving(false);
   }
@@ -330,7 +362,9 @@ export function Field({
           <div className="field-task-top">
             <span>
               <MapPin size={16} />
-              SITE 07 / INVERTER 04
+              {task
+                ? `${site?.name ?? "SITE"} / ${code}`.toUpperCase()
+                : "FIELD TASKS"}
             </span>
             <span className={`badge ${offline ? "warning" : "green-badge"}`}>
               {offline ? <WifiOff size={13} /> : <Check size={13} />}{" "}
@@ -341,20 +375,42 @@ export function Field({
                 : "CONNECTED"}
             </span>
           </div>
+          {tasks.length > 1 && (
+            <div
+              className="task-picker"
+              role="radiogroup"
+              aria-label="Field tasks"
+            >
+              {tasks.map((item) => (
+                <button
+                  key={item.id}
+                  role="radio"
+                  aria-checked={item.id === task?.id}
+                  className={item.id === task?.id ? "selected" : ""}
+                  onClick={() => choose(item.id)}
+                >
+                  <strong>{item.subject_code}</strong>
+                  <small>
+                    {state.sites.find((s) => s.id === item.site_id)?.name}
+                    {item.gates_decision ? " · blocks an approval" : ""}
+                  </small>
+                </button>
+              ))}
+            </div>
+          )}
           {task ? (
             <div className="field-task-body">
               <div className="field-task-count">
-                EQUIPMENT COMPLIANCE LOG <span>INV-04</span>
+                EQUIPMENT COMPLIANCE LOG <span>{code}</span>
               </div>
-              <h2>
-                Is the red fault
-                <br />
-                indicator active?
-              </h2>
-              <p>Check the front panel. Record only what you can observe.</p>
+              <h2>{task.question}</h2>
+              <p>
+                {task.subject_label}. Check it in person and record only what
+                you can observe.
+              </p>
               <div className="equipment-figure">
                 <div className="equipment-body">
-                  <div className="equipment-label">INV / 04</div>
+                  <div className="equipment-label">{code}</div>
                   <div className="equipment-screen">
                     <i />
                     <i />
@@ -369,9 +425,9 @@ export function Field({
                 </div>
                 <div className="figure-callout">
                   <span />
-                  CHECK THE
+                  CHECK
                   <br />
-                  RED INDICATOR
+                  {code}
                 </div>
               </div>
               <div className="field-choices">
@@ -385,7 +441,7 @@ export function Field({
                 >
                   <Check size={25} />
                   <strong>Yes</strong>
-                  <span>Red light is active</span>
+                  <span>I can confirm it</span>
                 </button>
                 <button
                   className={fault === false ? "chosen" : ""}
@@ -397,14 +453,14 @@ export function Field({
                 >
                   <X size={25} />
                   <strong>No</strong>
-                  <span>No visible fault</span>
+                  <span>Not observed</span>
                 </button>
               </div>
               <fieldset className="compliance-checks">
                 <legend>Complete the compliance observations</legend>
                 {(
                   [
-                    ["asset_matched", "Equipment label matches INV-04"],
+                    ["asset_matched", `Equipment label matches ${code}`],
                     ["work_area_checked", "Surrounding work area checked"],
                     [
                       "protective_equipment_checked",
@@ -440,7 +496,7 @@ export function Field({
                 </label>
                 <button
                   className="button secondary"
-                  onClick={() => add(samplePhoto())}
+                  onClick={() => add(samplePhoto(code))}
                 >
                   Use demo illustration
                 </button>
@@ -477,7 +533,7 @@ export function Field({
                       src={attachment.data_url}
                       alt={
                         attachment.demo_fixture
-                          ? "Labeled sample inverter illustration"
+                          ? "Labeled sample equipment illustration"
                           : "Attached field evidence"
                       }
                     />
@@ -488,7 +544,7 @@ export function Field({
               ))}
               {hot && (
                 <label className="asset-readback">
-                  Read the equipment label and type INV-04
+                  Read the equipment label and type {code}
                   <input
                     value={asset}
                     onChange={(e) => setAsset(e.target.value)}
@@ -542,7 +598,8 @@ export function Field({
               <CheckCircle2 size={42} />
               <h2>No field task waiting.</h2>
               <p>
-                Request physical verification from the review queue to begin.
+                Triggers and supervisors dispatch checks here. Saved reports
+                below sync when you reconnect.
               </p>
             </div>
           )}
@@ -552,38 +609,55 @@ export function Field({
             <div className="panel-heading">
               <div>
                 <h2>The context you need</h2>
-                <p>Provided by the site planner</p>
+                <p>Live readings from the workspace</p>
               </div>
             </div>
-            <div className="field-context-row">
-              <span className="context-dot amber-bg" />
-              <div>
-                <strong>Vibration is above normal</strong>
-                <p>78°C · 13 recorded error events</p>
+            {subject ? (
+              Object.entries(subject.metrics).map(([key, value]) => {
+                const field = fieldFor(state, "assets", key);
+                return (
+                  <div className="field-context-row" key={key}>
+                    <span className="context-dot amber-bg" />
+                    <div>
+                      <strong>{field?.label ?? key}</strong>
+                      <p>{formatValue(field, value)}</p>
+                    </div>
+                  </div>
+                );
+              })
+            ) : (
+              <div className="field-context-row">
+                <span className="context-dot blue-bg" />
+                <div>
+                  <strong>
+                    {task ? task.subject_label : "No task selected"}
+                  </strong>
+                  <p>
+                    {task ? `Code ${code}` : "Waiting for the next dispatch"}
+                  </p>
+                </div>
               </div>
-            </div>
-            <div className="field-context-row">
-              <span className="context-dot blue-bg" />
-              <div>
-                <strong>No replacement fan in stock</strong>
-                <p>Cooling fan X14 · 0 available</p>
+            )}
+            {site && (
+              <div className="field-context-row">
+                <span className="context-dot green-bg" />
+                <div>
+                  <strong>{site.name}</strong>
+                  <p>
+                    {site.technician || "Site technician"} · next visit in{" "}
+                    {site.next_visit_days} days
+                  </p>
+                </div>
               </div>
-            </div>
-            <div className="field-context-row">
-              <span className="context-dot green-bg" />
-              <div>
-                <strong>A visit is already scheduled</strong>
-                <p>Alex Rivera · In 3 days</p>
-              </div>
-            </div>
+            )}
             <div className="context-bottom">
               <span className="eyebrow small">
                 WHY YOUR OBSERVATION MATTERS
               </span>
               <p>
-                The fault observation, image, checklist, and timestamp support
-                the supervisor’s decision. Voice notes provide optional context.
-                A report alone never authorizes spending.
+                {task?.gates_decision
+                  ? "A purchase is waiting on your answer. The observation, image, checklist, and timestamp support the supervisor’s decision; a report alone never authorizes spending."
+                  : "Your answer is recorded against the trigger that raised it, with the image, checklist, and timestamp as evidence."}
               </p>
             </div>
           </section>
@@ -637,8 +711,8 @@ export function Field({
               </span>
               <div className="row-main">
                 <strong>
-                  {report.asset_id} · Fault indicator{" "}
-                  {report.fault ? "active" : "not active"}
+                  {report.asset_code} · {report.answer ? "Yes" : "No"}
+                  {report.question ? ` — ${report.question}` : ""}
                 </strong>
                 <small>
                   {report.note || "No additional note"} ·{" "}
