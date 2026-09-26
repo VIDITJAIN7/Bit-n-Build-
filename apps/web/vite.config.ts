@@ -2,7 +2,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
-const previewBranch = "codex/workkite-preview-toggle";
+const previewBranch = "workkite-preview-switcher";
 
 export default defineConfig({
   define: {
