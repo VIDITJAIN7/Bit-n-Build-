@@ -19,7 +19,7 @@ Vercel Functions / API
 
 ## Setup sequence
 
-1. Vercel is configured by `vercel.json`: repository root, `npm run build`, and `apps/web/dist`. Vite deep links use the SPA rewrite; `api/index.py` routes `/api/*` to FastAPI. FastAPI's Python runtime is still Beta, so validate a preview deployment before treating this as a production service.
+1. Vercel is configured by `vercel.json`: repository root, `npm run build`, and `apps/web/dist`. Vite deep links use the SPA rewrite, which excludes `/api`; `api/[...path].py` exposes FastAPI under `/api/*`. FastAPI's Python runtime is still Beta, so validate a preview deployment before treating this as a production service.
 2. The four Supabase migrations recorded in `supabase/migrations/README.md` have been applied to the Workkite project. They provision workspace membership, roles, a locked Postgres state record, media metadata, RLS policies, an Auth bootstrap trigger, and a private evidence bucket. The first invited Auth account becomes the initial workspace admin; later invited accounts become workers.
 3. The backend now has a Postgres repository adapter. Local mode remains SQLite; hosted mode requires `WORKKITE_ENV=production` and server-side Supabase settings. State reads/mutations are scoped to the workspace found from the authenticated membership, and PostgreSQL row locks keep updates atomic. Do not deploy until all environment variables are set and Vercel's build passes.
 4. The sign-in form uses Supabase Auth when its public URL/key are configured. The API verifies every access token with Supabase Auth, reads the user's RLS-protected workspace membership, protects admin routes, and filters worker data. Role decisions never come from browser storage or user-editable profile metadata.
