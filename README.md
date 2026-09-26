@@ -4,6 +4,8 @@
 
 Workkite is designed for organizations that operate across multiple sites and need routine work to move quickly without giving automation unchecked authority. Solar-farm examples are included, but tasks, conditions, actions, and report fields are workspace data, so the same workflow can be configured for other industries.
 
+Simplified Demo Site "Not actual product" : [here](workkite.vercel.app) (Finished live site is as shown in demo video)
+
 ## Goals
 
 - **Reduce routine coordination.** Turn changing workspace data into proposed actions, scheduled work, and worker assignments.
