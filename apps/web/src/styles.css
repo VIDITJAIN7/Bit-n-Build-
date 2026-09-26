@@ -375,6 +375,29 @@ small {
   align-items: center;
   gap: 20px;
 }
+.preview-view-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #f7f8f4;
+}
+.preview-view-switch button {
+  min-height: 30px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 600;
+}
+.preview-view-switch button[aria-pressed="true"] {
+  color: #fff;
+  background: var(--green);
+}
 .connection {
   display: flex;
   align-items: center;

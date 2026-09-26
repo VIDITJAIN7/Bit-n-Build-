@@ -25,6 +25,7 @@ import {
   clearLocalData,
 } from "./offline";
 import { authClient, remoteAuthEnabled } from "./auth";
+import { previewMode, previewReport } from "./preview";
 import { industryIcon } from "./rules";
 import type {
   FieldReport,
@@ -77,13 +78,13 @@ export type BuilderTarget = { triggerId?: string; draft?: TriggerDraft };
 export default function App() {
   const [state, setState] = useState<State | null>(null);
   const [role, setRole] = useState<"admin" | "worker">(
-    () => readSavedRole() ?? "admin",
+    () => previewMode ? "admin" : readSavedRole() ?? "admin",
   );
   const [session, setSession] = useState(
-    () => !remoteAuthEnabled && localStorage.getItem(ROLE_KEY) !== null,
+    () => previewMode || (!remoteAuthEnabled && localStorage.getItem(ROLE_KEY) !== null),
   );
   const [accountEmail, setAccountEmail] = useState(
-    () => remoteAuthEnabled ? "" : localStorage.getItem(EMAIL_KEY) ?? "",
+    () => previewMode ? "Workspace Admin" : remoteAuthEnabled ? "" : localStorage.getItem(EMAIL_KEY) ?? "",
   );
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
@@ -146,7 +147,7 @@ export default function App() {
     };
   }, []);
   useEffect(() => {
-    if (remoteAuthEnabled) return;
+    if (remoteAuthEnabled || previewMode) return;
     const syncAcrossTabs = () => {
       const savedRole = localStorage.getItem(ROLE_KEY);
       const validRole = savedRole === "admin" || savedRole === "worker";
@@ -233,6 +234,7 @@ export default function App() {
     return () => clearInterval(timer);
   }, [offline, loading, refresh]);
   const synchronize = useCallback(async () => {
+    if (previewMode) return;
     if (offline) return;
     try {
       await syncReports();
@@ -287,6 +289,22 @@ export default function App() {
     report: FieldReport,
     context: Pick<LocalReport, "subject_label" | "question" | "field_labels">,
   ) {
+    if (previewMode) {
+      const updated = previewReport(report);
+      setState(updated);
+      setReports((current) => [
+        {
+          ...report,
+          sync: "confirmed",
+          subject_label: context.subject_label,
+          question: context.question,
+          field_labels: context.field_labels,
+        },
+        ...current,
+      ]);
+      notify("Report saved.");
+      return true;
+    }
     try {
       await enqueue(report, context);
       setReports(await listReports());
@@ -363,6 +381,14 @@ export default function App() {
     setSession(false);
     setAccountEmail("");
     window.history.replaceState({}, "", "/login");
+  }
+  function switchPreviewRole(next: "admin" | "worker") {
+    setRole(next);
+    setAccountEmail(next === "admin" ? "Workspace Admin" : "Worker 1");
+    setPage(next === "worker" ? "field" : "control");
+    setSiteFilter("all");
+    localStorage.setItem(ROLE_KEY, next);
+    window.history.replaceState({}, "", next === "worker" ? "/worker" : "/admin");
   }
   const workerMode = role === "worker";
   function openBuilder(target: BuilderTarget = {}) {
@@ -483,13 +509,13 @@ export default function App() {
               </small>
             </div>
             <span className="profile-dot" />
-            <button
+            {!previewMode && <button
               className="icon-button"
               onClick={signOut}
               aria-label="Sign out"
             >
               <LogOut size={16} />
-            </button>
+            </button>}
           </div>
         </div>
       </aside>
@@ -516,6 +542,12 @@ export default function App() {
                 />
               </div>
               <div className="topbar-right">
+                {previewMode && (
+                  <div className="preview-view-switch" role="group" aria-label="Workspace view">
+                    <button aria-pressed={workerMode} onClick={() => switchPreviewRole("worker")}>Worker</button>
+                    <button aria-pressed={!workerMode} onClick={() => switchPreviewRole("admin")}>Admin</button>
+                  </div>
+                )}
                 <span className="connection">
                   {offline ? (
                     <WifiOff size={14} />
@@ -524,13 +556,13 @@ export default function App() {
                   )}
                   {offline ? "Offline" : "Online"}
                 </span>
-                <button
+                {!previewMode && <button
                   className="icon-button"
                   onClick={signOut}
                   aria-label="Sign out"
                 >
                   <LogOut size={17} />
-                </button>
+                </button>}
               </div>
             </>
           ) : (
@@ -546,6 +578,12 @@ export default function App() {
                 <strong>{site ? site.name : "All sites"}</strong>
               </div>
               <div className="topbar-right">
+                {previewMode && (
+                  <div className="preview-view-switch" role="group" aria-label="Workspace view">
+                    <button aria-pressed={workerMode} onClick={() => switchPreviewRole("worker")}>Worker</button>
+                    <button aria-pressed={!workerMode} onClick={() => switchPreviewRole("admin")}>Admin</button>
+                  </div>
+                )}
                 <span className="connection">
                   {offline ? (
                     <WifiOff size={14} />
@@ -554,13 +592,13 @@ export default function App() {
                   )}
                   {connected ? "Online" : "Offline"}
                 </span>
-                <button
+                {!previewMode && <button
                   className="icon-button"
                   onClick={signOut}
                   aria-label="Sign out"
                 >
                   <LogOut size={17} />
-                </button>
+                </button>}
               </div>
             </>
           )}

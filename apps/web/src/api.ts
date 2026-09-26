@@ -1,11 +1,13 @@
 import type { Method, State } from "./types";
 import { authClient } from "./auth";
+import { previewCommand, previewMode, previewState } from "./preview";
 
 export async function request<T>(
   path: string,
   body?: object,
   method?: Method,
 ): Promise<T> {
+  if (previewMode) return previewState() as T;
   const verb = method ?? (body === undefined ? "GET" : "POST");
   const { data } = authClient ? await authClient.auth.getSession() : { data: { session: null } };
   const response = await fetch(`/api${path}`, {
@@ -36,7 +38,9 @@ export const sendCommand = (
   path: string,
   body: object = {},
   method: Method = "POST",
-) => request<{ state: State; message: string }>(path, body, method);
+) => previewMode
+  ? Promise.resolve(previewCommand(path, body))
+  : request<{ state: State; message: string }>(path, body, method);
 export const mediaUrl = (reportId: string, kind: "photo" | "audio") =>
   `/api/reports/${encodeURIComponent(reportId)}/media/${kind}`;
 export async function loadEvidence(reportId: string, kind: "photo" | "audio") {
