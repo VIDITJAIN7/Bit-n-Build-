@@ -1,26 +1,91 @@
 # Workkite
 
-Workkite helps teams manage work across multiple sites. Administrators define tasks from workspace data; the operations agent proposes and schedules routine work; deterministic policy controls what can run automatically; workers complete assigned tasks and record field evidence. The same task engine can support different industries by using each workspace's own sites, records, conditions, actions, and report fields.
+**Workkite turns operational signals into clear, trackable work for teams in the field.** An administrator defines what should be monitored and what action may follow. The operations agent evaluates matching records, proposes or schedules work, and sends eligible actions through fixed policy checks. Workers complete their assigned tasks—even when offline—and submit a traceable report.
 
-## What is included
+Workkite is designed for organizations that operate across multiple sites and need routine work to move quickly without giving automation unchecked authority. Solar-farm examples are included, but tasks, conditions, actions, and report fields are workspace data, so the same workflow can be configured for other industries.
 
-- **Admin workspace:** overview, task creation and editing, workspace data, review queue, access and recovery, activity, and external connection settings.
-- **Worker workspace:** assigned work, readable field forms, offline report drafts, and retry-safe sync.
-- **Operations agent:** a deterministic rules planner by default, with a replaceable OpenAI-compatible AI commander option for proposing task handling, schedule, priority, and assignee.
-- **Policy gate:** checks approved suppliers, known payment destinations, per-action and daily limits, typical purchase size, evidence requirements, and wallet balance. The AI cannot edit policy or directly approve a purchase.
-- **Local adapters:** SQLite, local authentication for development, simulated telemetry/weather, and a local wallet adapter.
-- **Hosted adapters:** Supabase Auth and workspace-scoped Postgres, FastAPI routes on Vercel, and optional server-side AI configuration.
-- **Wallet contract:** Solidity reference implementation and local tests. It is not deployed or connected to the app; the UI does not send real transactions.
+## Goals
 
-The repository includes editable solar-farm records and tasks as starter content. The task system is not limited to solar operations. To start an empty company workspace locally, use the setting described below.
+- **Reduce routine coordination.** Turn changing workspace data into proposed actions, scheduled work, and worker assignments.
+- **Keep people in control.** Enforce spending, supplier, destination, evidence, and approval rules outside the AI model.
+- **Work in the field.** Make worker tasks readable and usable outdoors, save reports offline, and sync safely when a connection returns.
+- **Adapt to each operation.** Let administrators define task logic and connect their chosen systems without baking one industry's vocabulary into the workflow engine.
 
-## Requirements
+## How Workkite works
+
+An administrator creates a task from workspace data. It can run automatically when its conditions match, or wait for a person to run it. The operations agent evaluates the task and proposes the next action. Policy decides whether that action can proceed, needs review, or must stop. Work that needs a person becomes a field assignment; reports return to the workspace and activity history.
+
+```mermaid
+flowchart LR
+    A[Admin defines a task] --> B[Workspace data matches]
+    B --> C[Operations agent proposes next step]
+    C --> D{Policy check}
+    D -->|Allowed| E[Run or schedule action]
+    D -->|Review needed| F[Human review]
+    D -->|Not allowed| G[Stop and record]
+    E --> H[Assign worker task]
+    F --> H
+    H --> I[Worker records field report]
+    I --> J[Update workspace and activity]
+```
+
+### Automation and human control
+
+The rules planner works without an AI API and matches administrator-defined task conditions to workspace records. When configured, the AI commander can propose how to handle an eligible case, when to schedule it, its priority, and a suitable assignee from the configured options. A separate, optional AI risk reviewer can add review friction.
+
+The model is a planner, not the authority. It cannot change an administrator's task definition, supplier, amount, recipient, limits, or approval role. The server checks every proposal against deterministic policy. Low-risk actions can proceed only when they satisfy configured limits; exceptions go to a human; disallowed actions stop. If an AI provider is unavailable, rate-limited, or returns an invalid proposal, Workkite routes the item for human review.
+
+```mermaid
+flowchart TD
+    A[Task match] --> B{Planner}
+    B -->|Rules mode| C[Configured rules]
+    B -->|AI mode| D[AI proposal]
+    C --> E[Server policy]
+    D --> E
+    E -->|Within limits| F[Eligible to proceed]
+    E -->|Needs judgment| G[Human review]
+    E -->|Outside policy| H[Blocked]
+```
+
+In a hosted deployment, Workkite does not run a permanent background process. Configure the secured scheduled endpoint to invoke the agent regularly; otherwise saved tasks remain available, but scheduled automation does not run by itself.
+
+### Admin and worker experience
+
+- **Admin workspace:** see what needs attention, define and edit tasks, maintain sites and operational data, review exceptions, and manage workspace access.
+- **Task builder:** choose a data source, conditions, behavior, and action. Report fields and worker task options follow the saved task definition.
+- **Worker workspace:** see assigned work, identify the relevant site or asset, complete large readable controls, capture evidence, and save reports offline for later sync.
+- **Activity and review:** inspect proposed, completed, blocked, and human-reviewed actions with their related field reports.
+- **Connections:** record which vendors and endpoints the organization plans to use. These settings prepare the integration points; they do not by themselves create live vendor connections.
+
+### Modular by design
+
+The app separates workflow logic from external providers. The AI provider, data repository, telemetry feed, weather source, wallet, and other integrations sit behind server-side interfaces. Local development uses replaceable local adapters; hosted mode uses Supabase Auth and Postgres. New providers can be added by implementing the relevant adapter while keeping the task workflow and policy checks in place.
+
+```mermaid
+flowchart LR
+    UI[Admin and worker app] --> API[FastAPI service]
+    API --> CORE[Tasks, agent, and policy]
+    CORE --> AI[Rules planner or AI adapter]
+    CORE --> DATA[SQLite or Supabase Postgres]
+    CORE --> PORTS[Telemetry, workforce, weather, wallet adapters]
+    PORTS -. provider implementation .-> EXT[Organization's chosen systems]
+```
+
+## Current capabilities and boundaries
+
+- **Included:** React/Vite interface, FastAPI API, editable task rules, worker reports with local offline queue, local SQLite development, Supabase Auth/Postgres hosted adapter, replaceable OpenAI-compatible AI provider, and policy-checked action proposals.
+- **AI is optional:** the default rules planner works without an API key. Configure a server-side key to use an AI commander. Never expose provider keys in browser variables such as `VITE_*` or commit them.
+- **External connections are extension points:** telemetry/SCADA, inventory/procurement, workforce dispatch, weather, notifications, and RPC settings do not activate vendor integrations until their adapters are implemented and configured.
+- **Wallet status:** a Solidity reference contract and tests are included, but it is not deployed or connected to the UI. The app does not send real blockchain transactions.
+- **Evidence storage:** hosted report metadata and media are currently stored through Postgres. A private Supabase Storage bucket exists, but direct browser uploads are not wired yet; avoid relying on large photo/audio uploads at scale.
+
+## Run locally
+
+### Requirements
 
 - Node.js 22.12 or newer and npm.
 - Python 3.11 or newer.
-- Git (for cloning and version control).
-
-## Run locally
+- Git, if cloning the repository.
 
 From the repository root:
 
@@ -29,7 +94,7 @@ npm run setup
 Copy-Item .env.example .env
 ```
 
-Edit the ignored `.env` file. For a clean company workspace without starter sites, assets, inventory, suppliers, or tasks, set:
+Edit the ignored `.env` file. To start with an empty company workspace instead of the included solar starter records, set:
 
 ```dotenv
 WORKKITE_LOCAL_EMPTY_WORKSPACE=true
@@ -37,17 +102,19 @@ WORKKITE_LOCAL_WORKSPACE_NAME=Your company
 WORKKITE_LOCAL_USERS_JSON=[{"username":"admin","password":"change-this","role":"admin","display_name":"Workspace Admin"},{"username":"worker1","password":"change-this-too","role":"worker","display_name":"Field Worker"}]
 ```
 
-Use your own local-only passwords. `WORKKITE_LOCAL_USERS_JSON` is read only by the local API; the credentials are not included in the browser bundle. Local username sign-in only selects the local interface role and does **not** secure API routes. Never enable local sign-in or use these credentials in a public deployment. Hosted sign-in uses Supabase Auth.
+Choose your own local passwords. Local username sign-in only selects a local interface role; it does **not** secure API routes. These credentials are read by the local API and are not part of the browser bundle. Never use them in a public deployment. Hosted sign-in uses Supabase Auth.
 
-Start the web app and API together:
+Start the frontend and API together:
 
 ```powershell
 npm run dev
 ```
 
-Open <http://127.0.0.1:5173>. The web server is bound to loopback; the FastAPI service runs at `http://127.0.0.1:8000`. Use **Ctrl+C** to stop both. The local API creates its SQLite database under `apps/api/data/`; database files are ignored by Git.
+Open <http://127.0.0.1:5173>. The frontend uses loopback port 5173 and the FastAPI service uses port 8000. Stop both with **Ctrl+C**. SQLite data is stored under `apps/api/data/` and ignored by Git.
 
-To use the AI commander locally, set these in `.env` using a provider-supported model and a server-side API key:
+### Configure an AI provider
+
+Add these values to the API's `.env` file to use Gemini Flash through its OpenAI-compatible endpoint:
 
 ```dotenv
 WORKKITE_AGENT=ai-commander
@@ -57,45 +124,39 @@ WORKKITE_LLM_API_KEY=your-secret-key
 WORKKITE_LLM_REASONING_EFFORT=none
 ```
 
-For Mistral, use `https://api.mistral.ai/v1` and a Mistral model ID supported by your account. Never put a provider key in a `VITE_*` variable or commit it. `WORKKITE_RISK_REVIEWER=ai` enables the separate optional risk review; it is distinct from the commander. If the AI is unavailable, rate-limited, or returns an invalid decision, the item is routed for human review.
+For Mistral, set the base URL to `https://api.mistral.ai/v1`, use a model available to your account, and provide its key. The optional separate AI risk reviewer is enabled with `WORKKITE_RISK_REVIEWER=ai`. Keep both provider settings and secrets on the API server. See [the integration guide](docs/integrations.md) for provider behavior, limits, and how to add another adapter.
 
-## Production setup
+## Production deployment
 
-The deployment target is one Vercel project connected to this repository plus one Supabase project. Vercel builds the Vite frontend and serves the FastAPI backend from `api/index.py`; the `/api/*` rewrite preserves nested API paths. Hosted API mode requires Supabase Auth and Postgres configuration and does not start a persistent agent loop. Purchases still use no real wallet: the production wallet is unconfigured until a wallet/RPC adapter is implemented and deliberately connected.
+The deployment target uses a Vercel project connected to this repository and a Supabase project. `vercel.json` builds the Vite app and routes `/api/*` to the FastAPI entry point at `api/index.py`. Hosted API mode uses Supabase Auth and workspace-scoped Postgres; it does not start a permanent agent loop.
 
-1. Apply every SQL migration in `supabase/migrations/` to the Supabase project. The migration guide explains workspace roles and Auth invitation behavior.
-2. Set Supabase Auth's site URL to the production site and disable open self-registration. Invite the first administrator through Supabase Auth; the database bootstrap assigns the first invited account the admin role and later invited accounts the worker role.
-3. Import the repository into Vercel with the **repository root** as the project root. The checked-in `vercel.json` provides the build command and output directory. Set these Vercel variables for Production (and Preview if needed):
-   - `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` for the browser Auth client. The publishable key is intentionally public.
-   - `WORKKITE_ENV=production`, `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, and `SUPABASE_DATABASE_URL` for the API. Use Supabase's transaction-pooler connection string for Vercel's serverless runtime.
+1. Apply the migrations in `supabase/migrations/` to Supabase. See [the migration notes](supabase/migrations/README.md).
+2. Set the Supabase Auth site URL to the deployed site and disable open self-registration. Invite the first administrator through Supabase Auth. The database bootstrap assigns the first invited account the admin role and later invited accounts the worker role.
+3. Import the repository into Vercel with the repository root as the project root. Configure these environment variables in Vercel:
+   - Browser Auth: `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY` (public publishable key).
+   - API and database: `WORKKITE_ENV=production`, `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, and `SUPABASE_DATABASE_URL`. Use the Supabase transaction-pooler connection string for the serverless runtime.
    - Optional AI: `WORKKITE_AGENT=ai-commander`, `WORKKITE_LLM_BASE_URL`, `WORKKITE_LLM_MODEL`, and secret `WORKKITE_LLM_API_KEY`; optionally `WORKKITE_LLM_REASONING_EFFORT` and `WORKKITE_RISK_REVIEWER=ai`.
-   - Optional scheduled processing: create a high-entropy `CRON_SECRET`, store it in Vercel and Supabase Vault, then configure Supabase Cron/`pg_net` to call `GET https://<your-domain>/api/cron/agent` each minute with `Authorization: Bearer <CRON_SECRET>`.
-4. Redeploy after setting or changing environment variables. Confirm `/api/health`, authentication, and a complete admin-to-worker task/report flow on the deployed URL.
+   - Optional scheduled automation: set a high-entropy `CRON_SECRET` in Vercel and Supabase Vault, then use Supabase Cron/`pg_net` to call `GET https://<your-domain>/api/cron/agent` each minute with `Authorization: Bearer <CRON_SECRET>`.
+4. Redeploy after changing environment variables. Check `/api/health`, sign in, and verify an admin-created task reaches a worker and its report returns to the workspace.
 
-The production schema stores workspace data in a locked JSONB state row and report media metadata in Postgres. A private Supabase Storage bucket is provisioned, but direct evidence uploads are not wired yet. Keep photos/audio usage modest until the upload path moves to Storage. The Connections page stores administrator-entered provider names and endpoints; those entries do not activate live SCADA, inventory, workforce, weather, notification, or wallet integrations. See [the deployment guide](docs/deployment-vercel-supabase.md) and [migration notes](supabase/migrations/README.md) before changing hosted resources.
+Vercel build and Supabase configuration details are in [the deployment guide](docs/deployment-vercel-supabase.md). Purchases do not move real funds until an authorized wallet/RPC adapter and transaction flow are deliberately implemented.
 
-## AI and external systems
-
-The AI commander proposes how to handle eligible cases and when to schedule work. The server validates proposals and applies deterministic policy before an action executes. AI risk review is a separate optional adapter. Provider configuration is isolated behind replaceable interfaces; integration details and security limits are in [docs/integrations.md](docs/integrations.md).
-
-The Connections page is prepared for administrators to record the vendor and endpoint they plan to connect for telemetry/SCADA, inventory/procurement, workforce/dispatch, weather, and wallet/RPC. These are integration settings, not working vendor connectors. Before relying on these systems, implement and test the corresponding server-side adapters, authentication, data freshness, retries, and audit behavior. The browser wallet option only reads an injected account/chain; it does not sign or send transactions.
-
-## Checks
+## Run checks
 
 ```powershell
 npm run build
 npm test
 ```
 
-`npm test` runs the FastAPI suite and Solidity wallet tests against a local development environment. The Solidity contract is not deployed by the build. For focused checks, run `npm run test:api` or `npm run test:contracts`.
+`npm test` runs the FastAPI and Solidity contract test suites. For one suite only, run `npm run test:api` or `npm run test:contracts`. The contract tests use a local development chain; the contract is not deployed by these commands.
 
 ## Repository map
 
 ```text
 api/                         Vercel FastAPI entry point
-apps/api/averlock/           API, policy, agent, adapters, and repositories
+apps/api/averlock/           API, policy, agent, adapters, repositories
 apps/api/tests/              API and operations tests
-apps/web/                    React/Vite admin and worker application
+apps/web/                    React/Vite admin and worker interface
 contracts/                   Solidity wallet reference and tests
 supabase/migrations/         Hosted schema, roles, and RLS migrations
 deploy/vercel-supabase/       Production environment template
@@ -103,12 +164,12 @@ docs/                         Architecture, decisions, walkthrough, integrations
 scripts/                      Setup, local run, tests, and build support
 ```
 
-## Further documentation
+## More documentation
 
 - [Architecture](docs/architecture.md)
 - [Product brief](docs/product-brief.md)
 - [Implementation decisions](docs/decisions.md)
 - [Operator walkthrough](docs/operator-walkthrough.md)
-- [AI and connector integration guide](docs/integrations.md)
+- [AI and integration guide](docs/integrations.md)
 - [Vercel and Supabase deployment guide](docs/deployment-vercel-supabase.md)
 - [Supabase migrations](supabase/migrations/README.md)
