@@ -10,6 +10,7 @@ import {
   Mic,
   RefreshCw,
   Save,
+  Siren,
   Square,
   Sun,
   Upload,
@@ -22,73 +23,21 @@ import type {
   FieldReport,
   Attachment,
   Checklist,
+  IncidentReport,
+  LocalIncident,
   ReportFieldDefinition,
 } from "../types";
 import { time } from "../api";
+import { asDataURL, preparePhoto } from "../media";
 import { fieldFor, formatValue } from "../rules";
-import { HoldButton } from "./HoldButton";
+import { HoldButton, buzz } from "./HoldButton";
+import { IncidentHistory, IncidentReporter } from "./Incidents";
 
 const emptyChecklist: Checklist = {
   asset_matched: false,
   work_area_checked: false,
   protective_equipment_checked: false,
 };
-function asDataURL(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-}
-async function preparePhoto(
-  file: File,
-): Promise<{ data_url: string; name: string }> {
-  if (typeof createImageBitmap !== "function") {
-    if (file.size > 2800000)
-      throw new Error(
-        "This browser cannot resize the photo; choose an image under 2.8 MB.",
-      );
-    return { data_url: await asDataURL(file), name: file.name };
-  }
-  const bitmap = await createImageBitmap(file);
-  try {
-    let scale = Math.min(1, 1920 / Math.max(bitmap.width, bitmap.height));
-    let quality = 0.84;
-    for (let attempt = 0; attempt < 7; attempt += 1) {
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-      const context = canvas.getContext("2d");
-      if (!context) throw new Error("Photo resizing is unavailable.");
-      context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-      const blob = await new Promise<Blob>((resolve, reject) =>
-        canvas.toBlob(
-          (result) =>
-            result
-              ? resolve(result)
-              : reject(new Error("Photo compression failed.")),
-          "image/jpeg",
-          quality,
-        ),
-      );
-      if (blob.size <= 2500000) {
-        const stem = file.name.replace(/\.[^.]+$/, "");
-        return {
-          data_url: await asDataURL(blob),
-          name: `${stem || "field-photo"}.jpg`,
-        };
-      }
-      scale *= 0.78;
-      quality = Math.max(0.52, quality - 0.06);
-    }
-    throw new Error(
-      "Photo is still too large after resizing. Try a closer, smaller image.",
-    );
-  } finally {
-    bitmap.close();
-  }
-}
 export function Field({
   state,
   siteFilter,
@@ -96,12 +45,16 @@ export function Field({
   offline,
   onSave,
   onSync,
+  incidents,
+  onReportIncident,
   busy,
   workerMode = false,
 }: {
   state: State;
   siteFilter: string;
   reports: LocalReport[];
+  incidents: LocalIncident[];
+  onReportIncident: (incident: IncidentReport) => Promise<boolean>;
   offline: boolean;
   onSave: (
     report: FieldReport,
@@ -125,6 +78,7 @@ export function Field({
   >({});
   const [workerStep, setWorkerStep] = useState(0);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [reporting, setReporting] = useState(false);
   const media = useRef<MediaRecorder | null>(null);
   const stream = useRef<MediaStream | null>(null);
   const timeout = useRef<number | null>(null);
@@ -149,6 +103,30 @@ export function Field({
       (siteFilter === "all" || t.site_id === siteFilter),
   );
   const task = tasks.find((t) => t.id === selectedId) ?? tasks[0];
+  const busyOnSite = workerMode && (!!task || reporting);
+  useEffect(() => {
+    // Keep the screen on mid-task: a phone that dims in direct sun reads as blank.
+    if (!busyOnSite || !("wakeLock" in navigator)) return;
+    let lock: WakeLockSentinel | null = null;
+    let active = true;
+    const acquire = () => {
+      if (document.visibilityState !== "visible") return;
+      navigator.wakeLock
+        .request("screen")
+        .then((sentinel) => {
+          if (active) lock = sentinel;
+          else void sentinel.release();
+        })
+        .catch(() => undefined);
+    };
+    acquire();
+    document.addEventListener("visibilitychange", acquire);
+    return () => {
+      active = false;
+      document.removeEventListener("visibilitychange", acquire);
+      void lock?.release().catch(() => undefined);
+    };
+  }, [busyOnSite]);
   const code = task?.subject_code ?? "";
   const site = state.sites.find((s) => s.id === task?.site_id);
   const subject = state.assets.find((a) => a.id === task?.subject_id);
@@ -466,7 +444,30 @@ export function Field({
           </div>
         </div>
       )}
-      <div className={`field-layout ${workerMode ? "worker-layout" : ""}`}>
+      {reporting ? (
+        <IncidentReporter
+          state={state}
+          siteFilter={siteFilter}
+          onReport={onReportIncident}
+          onClose={() => setReporting(false)}
+        />
+      ) : (
+        <button
+          className="button incident-trigger"
+          onClick={() => {
+            buzz(20);
+            setReporting(true);
+          }}
+        >
+          <Siren size={20} />
+          Report an incident
+        </button>
+      )}
+      <IncidentHistory state={state} incidents={incidents} />
+      <div
+        className={`field-layout ${workerMode ? "worker-layout" : ""}`}
+        hidden={reporting}
+      >
         <section className="panel field-task">
           <div className="field-task-top">
             <span>
@@ -831,9 +832,10 @@ export function Field({
                   <button
                     className="button primary"
                     disabled={!stepValid}
-                    onClick={() =>
-                      setWorkerStep((step) => Math.min(3, step + 1))
-                    }
+                    onClick={() => {
+                      buzz(15);
+                      setWorkerStep((step) => Math.min(3, step + 1));
+                    }}
                   >
                     Continue
                   </button>

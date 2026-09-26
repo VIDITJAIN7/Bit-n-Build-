@@ -19,12 +19,16 @@ import {
   cachedState,
   cacheState,
   enqueue,
+  enqueueIncident,
+  listIncidents,
   listReports,
   syncReports,
 } from "./offline";
 import { industryIcon } from "./rules";
 import type {
   FieldReport,
+  IncidentReport,
+  LocalIncident,
   LocalReport,
   Method,
   Page,
@@ -91,6 +95,7 @@ export default function App() {
     nonce: 0,
   });
   const [reports, setReports] = useState<LocalReport[]>([]);
+  const [incidents, setIncidents] = useState<LocalIncident[]>([]);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [connected, setConnected] = useState(navigator.onLine);
@@ -155,6 +160,8 @@ export default function App() {
         if (active && cached) setState(cached);
         const local = await listReports();
         if (active) setReports(local);
+        const localIncidents = await listIncidents();
+        if (active) setIncidents(localIncidents);
       } catch {
         if (active) notify("Local browser storage is unavailable.");
       }
@@ -187,8 +194,8 @@ export default function App() {
     if (offline) return;
     try {
       await syncReports();
-      const local = await listReports();
-      setReports(local);
+      setReports(await listReports());
+      setIncidents(await listIncidents());
       await refresh();
     } catch (e) {
       notify(e instanceof Error ? e.message : "Unable to sync reports.");
@@ -248,6 +255,22 @@ export default function App() {
       notify(
         "Could not save locally. Check available browser storage and try again.",
       );
+      return false;
+    }
+  }
+  async function reportIncident(incident: IncidentReport) {
+    try {
+      await enqueueIncident(incident);
+      setIncidents(await listIncidents());
+      notify(
+        offline
+          ? "Incident saved on this device. It sends as soon as you reconnect."
+          : "Incident saved. Sending to your supervisors…",
+      );
+      if (!offline) await synchronize();
+      return true;
+    } catch {
+      notify("Could not save the incident. Check browser storage and try again.");
       return false;
     }
   }
@@ -537,6 +560,8 @@ export default function App() {
                   state={state}
                   siteFilter={siteFilter}
                   reports={reports}
+                  incidents={incidents}
+                  onReportIncident={reportIncident}
                   offline={offline}
                   onSave={saveReport}
                   onSync={synchronize}
@@ -589,6 +614,8 @@ export default function App() {
                       state={state}
                       siteFilter={siteFilter}
                       reports={reports}
+                      incidents={incidents}
+                      onReportIncident={reportIncident}
                       offline={offline}
                       onSave={saveReport}
                       onSync={synchronize}

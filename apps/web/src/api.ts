@@ -1,9 +1,12 @@
 import type { Method, State } from "./types";
 
+// Evidence uploads carry photos; give slow field connections time to finish them.
+export const UPLOAD_TIMEOUT_MS = 90000;
 export async function request<T>(
   path: string,
   body?: object,
   method?: Method,
+  timeoutMs = 10000,
 ): Promise<T> {
   const verb = method ?? (body === undefined ? "GET" : "POST");
   const response = await fetch(`/api${path}`, {
@@ -11,7 +14,7 @@ export async function request<T>(
     headers:
       body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(10000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
@@ -31,8 +34,11 @@ export const sendCommand = (
   body: object = {},
   method: Method = "POST",
 ) => request<{ state: State; message: string }>(path, body, method);
-export const mediaUrl = (reportId: string, kind: "photo" | "audio") =>
-  `/api/reports/${encodeURIComponent(reportId)}/media/${kind}`;
+export const mediaUrl = (
+  ownerId: string,
+  kind: "photo" | "audio",
+  collection: "reports" | "incidents" = "reports",
+) => `/api/${collection}/${encodeURIComponent(ownerId)}/media/${kind}`;
 export const money = (cents: number) =>
   new Intl.NumberFormat("en-US", {
     style: "currency",

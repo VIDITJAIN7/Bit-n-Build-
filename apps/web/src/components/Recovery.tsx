@@ -1,14 +1,29 @@
 import {
+  Blocks,
   Check,
   ChevronRight,
   Clock3,
+  FastForward,
   KeyRound,
   ShieldCheck,
   UserRound,
   Users,
 } from "lucide-react";
 import type { State, Command } from "../types";
-import { money } from "../api";
+import { ago, money } from "../api";
+
+const ROLE_NAMES: Record<string, string> = {
+  supervisor: "Primary supervisor",
+  "replacement-supervisor": "Replacement supervisor",
+  backup: "Backup approver",
+  agent: "Agent key",
+  "guardian-1": "Guardian 1",
+  "guardian-2": "Guardian 2",
+  "guardian-3": "Guardian 3",
+};
+const roleName = (role: string | null | undefined) =>
+  role ? (ROLE_NAMES[role] ?? role) : "Unknown";
+const short = (hash: string) => `${hash.slice(0, 10)}…${hash.slice(-6)}`;
 
 export function Recovery({
   state,
@@ -25,6 +40,8 @@ export function Recovery({
     !!recovery.unlock_at &&
     Date.parse(recovery.now) >= Date.parse(recovery.unlock_at);
   const step = { idle: 0, voting: 1, timelock: 2, complete: 3 }[recovery.stage];
+  const chain = state.chain;
+  const onChain = chain.mode === "local-chain";
   function operate(operation: string, actor?: string) {
     return command("/recovery", { operation, actor });
   }
@@ -41,14 +58,34 @@ export function Recovery({
           <strong>
             {state.supervision.backup_active
               ? "Backup approval is active"
-              : "Primary supervisor is available"}{" "}
-            · {state.supervision.silence_hours}h since primary action
+              : `${roleName(state.wallet.owner)} is available`}{" "}
+            · {state.supervision.silence_hours}h since the owner’s last action
           </strong>
           <p>
-            After 4 hours, pending decisions can route to the backup approver. After 7 days,
-            guardian recovery becomes eligible. Agent activity never refreshes
-            this clock. Each recorded approval is tied to a distinct authorizer.
+            After 4 hours, pending decisions can route to the backup approver,
+            who can approve up to {money(state.policy.backup_absence_cents)} in
+            total while the primary supervisor is away (
+            {money(state.supervision.backup_remaining_cents)} left). After 7
+            days, guardian recovery becomes eligible. Agent activity never
+            refreshes this clock.
           </p>
+        </div>
+        <div className="clock-controls" aria-label="Simulation clock">
+          <span>Simulate time away</span>
+          <button
+            className="button secondary"
+            disabled={busy}
+            onClick={() => command("/demo/clock", { hours: 4 })}
+          >
+            <FastForward size={14} /> 4 hours
+          </button>
+          <button
+            className="button secondary"
+            disabled={busy}
+            onClick={() => command("/demo/clock", { hours: 168 })}
+          >
+            <FastForward size={14} /> 7 days
+          </button>
         </div>
       </section>
       <div className="wallet-summary">
@@ -61,21 +98,23 @@ export function Recovery({
             {money(state.wallet.balance_cents)} <small>Available balance</small>
           </h2>
           <p>
-            Spending limits stay in place during access recovery.
+            {onChain
+              ? chain.connected
+                ? `OperatingWallet contract on the ${chain.network} (chain ${chain.chain_id}). Limits are enforced by the contract as well as the workspace.`
+                : `Local chain unavailable: ${chain.error ?? "not connected"}.`
+              : "Simulated payment account. Run npm run dev:chain to execute payments on a local EVM."}
           </p>
         </div>
         <div className="current-owner">
           <span>ACCOUNT OWNER</span>
           <strong>
             <UserRound size={16} />
-            {state.wallet.owner === "supervisor"
-              ? "Primary supervisor"
-              : "Replacement supervisor"}
+            {roleName(state.wallet.owner)}
           </strong>
           <small>
-            {state.wallet.owner === "supervisor"
-              ? "Primary supervisor"
-              : "Replacement supervisor"}
+            {onChain && chain.connected
+              ? `On chain: ${roleName(chain.owner_role)}`
+              : "Workspace record"}
           </small>
         </div>
       </div>
@@ -127,11 +166,11 @@ export function Recovery({
                   ? "Seven days without primary-supervisor activity have made recovery eligible."
                   : "Backup approval opens after 4 hours. Guardian recovery opens after 7 days without primary-supervisor activity."
                 : recovery.stage === "voting"
-                  ? "Two distinct designated guardians must approve the new supervisor."
+                  ? `Two distinct designated guardians must approve the nominee: ${roleName(recovery.candidate)}.`
                   : recovery.stage === "complete"
-                    ? "The new supervisor now has access. Funds remain in the account."
+                    ? `${roleName(state.wallet.owner)} now has access. Funds remain in the account.`
                     : ready
-                      ? "Finalize to transfer access to the replacement supervisor."
+                      ? `Finalize to transfer access to ${roleName(recovery.candidate).toLowerCase()}.`
                       : "The current owner can cancel during the waiting period."}
             </p>
             {recovery.stage === "timelock" && (
@@ -142,6 +181,15 @@ export function Recovery({
                 <div className="timelock-track">
                   <span style={{ width: ready ? "100%" : "3%" }} />
                 </div>
+                {!ready && (
+                  <button
+                    className="link-button"
+                    disabled={busy}
+                    onClick={() => operate("advance")}
+                  >
+                    <FastForward size={14} /> Simulate the 48 hours passing
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -174,13 +222,16 @@ export function Recovery({
             ))}
           </div>
           <div className="recovery-actions">
-            {recovery.stage === "idle" && (
+            {(recovery.stage === "idle" || recovery.stage === "complete") && (
               <button
                 className="button primary"
                 disabled={busy || !state.supervision.recovery_eligible}
                 onClick={() => operate("start")}
               >
-                Start recovery <ChevronRight size={17} />
+                {recovery.stage === "complete"
+                  ? "Start another recovery"
+                  : "Start recovery"}{" "}
+                <ChevronRight size={17} />
               </button>
             )}
             {(recovery.stage === "voting" || recovery.stage === "timelock") && (
@@ -248,11 +299,49 @@ export function Recovery({
             ))}
           </ol>
           <div className="recovery-contract-note">
-            <span className="eyebrow small">ALSO IN THIS REPOSITORY</span>
-            <p>Guardian approval and a waiting period protect access changes.</p>
+            <span className="eyebrow small">
+              {onChain ? "ENFORCED ON CHAIN" : "ALSO IN THIS REPOSITORY"}
+            </span>
+            <p>
+              The OperatingWallet contract applies the same quorum, timelock,
+              and backup limit, and refuses guardians or the backup as
+              nominees.
+            </p>
           </div>
         </aside>
       </div>
+      {onChain && (
+        <section className="panel chain-panel">
+          <div className="panel-heading">
+            <div className="section-title">
+              <Blocks size={18} />
+              <h2>Local chain transactions</h2>
+              {chain.connected && <span className="count">block {chain.block}</span>}
+            </div>
+            {chain.wallet && (
+              <code title={chain.wallet}>contract {short(chain.wallet)}</code>
+            )}
+          </div>
+          {chain.transactions?.length ? (
+            <div className="chain-list">
+              {[...chain.transactions].reverse().map((tx) => (
+                <div className="chain-row" key={tx.hash}>
+                  <code title={tx.hash}>{short(tx.hash)}</code>
+                  <span>
+                    <strong>{tx.summary}</strong>
+                    <small>
+                      {roleName(tx.from_role)} · block {tx.block} · gas{" "}
+                      {tx.gas_used.toLocaleString()} · {ago(tx.at)}
+                    </small>
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="empty-inline">No transactions yet.</p>
+          )}
+        </section>
+      )}
     </>
   );
 }

@@ -1,14 +1,17 @@
 """External services go behind these interfaces. The default adapters need no keys."""
 
-import random
 import json
+import random
 import re
+import threading
+from datetime import datetime
 from typing import Protocol
 from uuid import uuid4
 
 import httpx
 
-from .seed import now_iso
+from .catalog import choose_supplier
+from .seed import now_iso, sim_now
 from .triggers import evidence, render
 
 
@@ -21,11 +24,22 @@ class RiskReviewer(Protocol):
 
 
 class Wallet(Protocol):
-    def execute(self, state: dict, action: dict, autonomous: bool) -> dict: ...
+    mode: str
+
+    def prepare(self, state: dict, fresh: bool = False) -> None: ...
+    def execute(
+        self, state: dict, action: dict, autonomous: bool, actor: str | None = None
+    ) -> dict: ...
+    def record_decision(
+        self, state: dict, actor: str, decision_id: str, approved: bool
+    ) -> None: ...
+    def recover(self, state: dict, operation: str, actor: str | None) -> None: ...
+    def advance_time(self, state: dict, seconds: int) -> None: ...
+    def status(self, state: dict) -> dict: ...
 
 
 class Feed(Protocol):
-    def step(self, state: dict) -> int: ...
+    def step(self, state: dict, hours: int = 0) -> int: ...
 
 
 class WeatherSource(Protocol):
@@ -82,7 +96,8 @@ class LocalPlanner:
         if kind == "purchase":
             return self.purchase(state, then, row, base, matched)
         if kind == "work_order":
-            technician = site.get("technician") or "the site technician"
+            # The rule's assignee wins; otherwise the site's technician takes the job.
+            assignee = base["assignee"] or "the site technician"
             visit = site.get("next_visit_days")
             timing = f" for the visit in {visit} days" if visit is not None else ""
             return [
@@ -90,8 +105,7 @@ class LocalPlanner:
                     **base,
                     "kind": "work_order",
                     "title": render(then["title"] or "Inspect {name}", row),
-                    "assignee": site.get("technician", ""),
-                    "explanation": f"{matched} Work order assigned to {technician}{timing}.",
+                    "explanation": f"{matched} Work order assigned to {assignee}{timing}.",
                 }
             ]
         if kind == "field_check":
@@ -160,8 +174,9 @@ class LocalPlanner:
         if quantity <= 0:
             return []
         sku = row["sku"]
-        carriers = [s for s in state["suppliers"] if sku in s.get("catalog", {})]
-        if not carriers:
+        deadline = site.get("next_visit_days")
+        supplier, on_time, approved = choose_supplier(state, sku, deadline)
+        if not supplier:
             return [
                 {
                     **base,
@@ -171,12 +186,6 @@ class LocalPlanner:
                     f"but no supplier catalog lists {sku}.",
                 }
             ]
-        approved = [s for s in carriers if s["approved"]]
-        deadline = site.get("next_visit_days")
-        on_time = [s for s in approved if deadline is None or s["lead_days"] <= deadline]
-        supplier = min(
-            on_time or approved or carriers, key=lambda s: (s["catalog"][sku], s["lead_days"])
-        )
         price = supplier["catalog"][sku]
         if on_time:
             reason = (
@@ -186,7 +195,14 @@ class LocalPlanner:
             reason += (
                 f", before the next visit in {deadline} days." if deadline is not None else "."
             )
-            cheaper = [s for s in approved if s not in on_time and s["catalog"][sku] < price]
+            cheaper = [
+                s
+                for s in state["suppliers"]
+                if s["approved"]
+                and s.get("catalog", {}).get(sku, price) < price
+                and deadline is not None
+                and s["lead_days"] > deadline
+            ]
             if cheaper:
                 slow = min(cheaper, key=lambda s: s["catalog"][sku])
                 reason += f" {slow['name']} is cheaper but takes {slow['lead_days']} days."
@@ -276,91 +292,152 @@ class OpenAICompatibleRiskReviewer:
         }
 
 
+REVIEW_NOT_RUN = {
+    "score": 65,
+    "flags": ["AI risk review did not run for this proposal; human review required"],
+    "explanation": "The data changed after the risk review ran; this proposal waits for a person.",
+    "available": False,
+}
+REVIEW_FAILED = {
+    "score": 65,
+    "flags": ["AI risk review unavailable; human review required"],
+    "explanation": "The configured risk provider did not return a valid assessment.",
+    "available": False,
+}
+# Inventory rows carry these alongside any fields the trigger's conditions reference.
+RECORD_KEYS = ("code", "name", "type", "sku", "stock", "minimum", "shortfall")
+
+
 class AIReviewPlanner:
-    """Adds AI risk assessment to deterministic, admin-configured proposals."""
+    """Adds AI risk assessment to deterministic, admin-configured proposals.
+
+    Provider calls are slow, so they never run inside a database transaction: the service
+    calls `prepare` with the records about to fire, and `propose` then only attaches the
+    stored assessments. A proposal without one waits for a person.
+    """
 
     mode = "ai-risk"
+    MAX_READY = 200
 
     def __init__(self, reviewer, planner=None):
         self.reviewer = reviewer
         self.planner = planner or LocalPlanner()
+        self.ready = {}
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def key(context, proposal):
+        return (
+            context["trigger"]["id"],
+            context["record"]["id"],
+            *(proposal.get(name) for name in ("kind", "amount_cents", "quantity", "recipient")),
+        )
+
+    def prepare(self, contexts):
+        """Review the proposals these contexts will produce. Call outside any transaction."""
+        reviewed = {}
+        for context in contexts:
+            for proposal in self.planner.propose(context):
+                try:
+                    reviewed[self.key(context, proposal)] = self.reviewer.review(
+                        self.assessment_input(context, proposal)
+                    )
+                except Exception:
+                    # Provider errors increase friction instead of silently allowing automation.
+                    reviewed[self.key(context, proposal)] = dict(REVIEW_FAILED)
+        with self.lock:
+            self.ready.update(reviewed)
+            while len(self.ready) > self.MAX_READY:
+                self.ready.pop(next(iter(self.ready)))
 
     def propose(self, context):
         proposals = self.planner.propose(context)
+        for proposal in proposals:
+            with self.lock:
+                review = self.ready.pop(self.key(context, proposal), None)
+            proposal["ai_risk"] = review or dict(REVIEW_NOT_RUN)
+        return proposals
+
+    @staticmethod
+    def assessment_input(context, proposal):
         state, trigger, row = context["state"], context["trigger"], context["record"]
         site = next((item for item in state["sites"] if item["id"] == row["site_id"]), {})
         conditions = [
             {key: condition.get(key) for key in ("field", "op", "value")}
             for condition in trigger.get("conditions", [])
         ]
+        # The fields this rule actually tests, whatever the industry, plus identifiers.
+        keys = [*RECORD_KEYS, *(condition["field"] for condition in conditions)]
         supplier_id = trigger["action"].get("supplier_id")
         supplier = next(
-            (
-                item
-                for item in state["suppliers"]
-                if item["id"] == (supplier_id or "")
-            ),
-            None,
+            (item for item in state["suppliers"] if item["id"] == (supplier_id or "")), None
         )
-        typical = state["policy"].get("typical_purchase_cents") or 0
         spent = state["wallet"].get("agent_spent_cents", 0)
-        for proposal in proposals:
-            assessment_input = {
-                "trigger": {
-                    "name": trigger["name"],
-                    "source": trigger["source"],
-                    "conditions": conditions,
-                    "action_type": trigger["action"]["type"],
-                },
-                "site_industry": site.get("industry"),
-                "record": {
-                    key: row.get(key)
-                    for key in ("code", "name", "temperature_c", "battery_pct", "stock", "shortfall")
-                    if key in row
-                },
-                "proposal": {
-                    key: proposal.get(key)
-                    for key in ("kind", "amount_cents", "quantity", "requires_field_check")
-                },
-                "supplier": {
-                    "approved": bool(supplier and supplier.get("approved")),
-                    "recipient_known": bool(
-                        supplier and supplier.get("recipient") in state["policy"]["known_recipients"]
-                    ),
-                    "proposal_matches_supplier": bool(
-                        supplier and proposal.get("recipient") == supplier.get("recipient")
-                    ),
-                } if supplier_id else None,
-                "policy_context": {
-                    "per_action_limit_cents": state["policy"].get("agent_per_action_cents"),
-                    "daily_budget_remaining_cents": max(
-                        0, state["policy"].get("agent_daily_cents", 0) - spent
-                    ),
-                    "typical_purchase_cents": typical,
-                },
+        return {
+            "trigger": {
+                "name": trigger["name"],
+                "source": trigger["source"],
+                "conditions": conditions,
+                "action_type": trigger["action"]["type"],
+            },
+            "site_industry": site.get("industry"),
+            "record": {key: row[key] for key in dict.fromkeys(keys) if key in row},
+            "proposal": {
+                key: proposal.get(key)
+                for key in ("kind", "amount_cents", "quantity", "requires_field_check")
+            },
+            "supplier": {
+                "approved": bool(supplier and supplier.get("approved")),
+                "recipient_known": bool(
+                    supplier and supplier.get("recipient") in state["policy"]["known_recipients"]
+                ),
+                "proposal_matches_supplier": bool(
+                    supplier and proposal.get("recipient") == supplier.get("recipient")
+                ),
             }
-            try:
-                proposal["ai_risk"] = self.reviewer.review(assessment_input)
-            except Exception:
-                # Provider errors increase friction instead of silently allowing automation.
-                proposal["ai_risk"] = {
-                    "score": 65,
-                    "flags": ["AI risk review unavailable; human review required"],
-                    "explanation": "The configured risk provider did not return a valid assessment.",
-                    "available": False,
-                }
-        return proposals
+            if supplier_id
+            else None,
+            "policy_context": {
+                "per_action_limit_cents": state["policy"].get("agent_per_action_cents"),
+                "daily_budget_remaining_cents": max(
+                    0, state["policy"].get("agent_daily_cents", 0) - spent
+                ),
+                "typical_purchase_cents": state["policy"].get("typical_purchase_cents") or 0,
+            },
+        }
+
 
 class SimulatedFeed:
-    """Stands in for live telemetry: small drifts, rare excursions and stock consumption."""
+    """Stands in for live telemetry and site work.
+
+    Live mode (hours=0) drifts readings each agent cycle so a demo stays lively. Time-lapse
+    mode advances whole hours: items are used at their recorded daily rate, doors open and
+    close, fuel burns, and technicians finish work orders six hours after they are raised,
+    returning the reading that triggered them to normal. Rare consumption spikes stand in
+    for leaks, theft, or sensor faults.
+    """
 
     COUNTERS = ("_events", "_count")
     NON_NEGATIVE = ("_pct", "_min", "_events", "_count")
+    WORK_HOURS = 6
+    SPIKE_PER_ITEM_HOUR = 0.0005
 
     def __init__(self, rng=None):
         self.rng = rng or random.Random()
+        self.carry = {}
 
-    def step(self, state):
+    def step(self, state, hours=0):
+        changed = self.drift(state, hours)
+        if hours:
+            changed += self.consume(state, hours) + self.complete_work(state)
+        else:
+            stocked = [item for item in state["inventory"] if item["stock"] > 0]
+            if stocked and self.rng.random() < 0.3:
+                self.rng.choice(stocked)["stock"] -= 1
+                changed += 1
+        return changed
+
+    def drift(self, state, hours):
         changed = 0
         for item in state["assets"]:
             baselines = item.setdefault("baselines", {})
@@ -369,6 +446,12 @@ class SimulatedFeed:
                     continue
                 if key.endswith(self.COUNTERS):
                     new = value + (1 if self.rng.random() < 0.01 else 0)
+                elif hours and key.endswith("_open_min"):
+                    # Doors mostly stay shut; now and then a delivery leaves one open.
+                    opening = self.rng.random() < 0.03 * hours
+                    new = self.rng.randint(4, 20) if opening else round(value * 0.2)
+                elif hours and "fuel" in key:
+                    new = max(0, round(value - 0.35 * hours, 1))
                 else:
                     base = baselines.setdefault(key, value)
                     spread = max(abs(base) * 0.03, 0.5)
@@ -377,22 +460,104 @@ class SimulatedFeed:
                     else:
                         target = value + (base - value) * 0.25 + self.rng.gauss(0, spread)
                     new = round(target) if isinstance(value, int) else round(target, 1)
-                    if key.endswith(self.NON_NEGATIVE):
-                        new = max(0, new)
-                    if key.endswith("_pct"):
-                        new = min(100, new)
+                if key.endswith(self.NON_NEGATIVE):
+                    new = max(0, new)
+                if key.endswith("_pct"):
+                    new = min(100, new)
                 if new != value:
                     item["metrics"][key] = new
                     changed += 1
-        stocked = [item for item in state["inventory"] if item["stock"] > 0]
-        if stocked and self.rng.random() < 0.3:
-            self.rng.choice(stocked)["stock"] -= 1
-            changed += 1
         return changed
+
+    def consume(self, state, hours):
+        changed = 0
+        for item in state["inventory"]:
+            rate = item.get("daily_usage") or 0
+            # Routine use is steady (the same rhythm the seeded history follows); the carry
+            # keeps fractional use from rounding away. Only the rare spikes are erratic.
+            carry = self.carry.get(item["id"], 0) + rate * hours / 24 * self.rng.uniform(0.7, 1.3)
+            used = int(carry)
+            self.carry[item["id"]] = carry - used
+            if rate and self.rng.random() < self.SPIKE_PER_ITEM_HOUR * hours:
+                used += max(3, round(4 * rate))
+            if used and item["stock"]:
+                item["stock"] = max(0, item["stock"] - used)
+                changed += 1
+        return changed
+
+    def complete_work(self, state):
+        """Simulated technicians close work orders and fix what raised them."""
+        now = sim_now(state)
+        triggers = {trigger["id"]: trigger for trigger in state["triggers"]}
+        assets = {asset["id"]: asset for asset in state["assets"]}
+        done = 0
+        for action in state["actions"]:
+            if (
+                action["kind"] != "work_order"
+                or action["status"] != "executed"
+                or action.get("completed_at")
+                or not action.get("executed_sim_at")
+            ):
+                continue
+            started = datetime.fromisoformat(action["executed_sim_at"])
+            if (now - started).total_seconds() < self.WORK_HOURS * 3600:
+                continue
+            asset = assets.get(action["subject"]["id"])
+            trigger = triggers.get(action.get("trigger_id"))
+            if asset and trigger:
+                for condition in trigger["conditions"]:
+                    key = condition["field"]
+                    value = asset["metrics"].get(key)
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        continue
+                    restored = self.restore(key, condition, value)
+                    asset["metrics"][key] = restored
+                    asset.setdefault("baselines", {})[key] = restored
+            for task in state["field_tasks"]:
+                if task["action_id"] == action["id"] and task["status"] == "open":
+                    # Marked as simulated: no worker report or evidence exists for it.
+                    task.update(
+                        status="answered", answer=True, answered_at=now_iso(), simulated=True
+                    )
+            action["completed_at"] = now.isoformat()
+            done += 1
+        return done
+
+    @staticmethod
+    def restore(key, condition, value):
+        threshold = condition["value"]
+        if "fuel" in key or "battery" in key:
+            restored = 95
+        elif condition["op"] in ("gt", "gte"):
+            restored = threshold - max(abs(threshold) * 0.1, 3)
+        elif condition["op"] in ("lt", "lte"):
+            restored = threshold + max(abs(threshold) * 0.1, 3)
+        else:
+            return value
+        return round(restored) if isinstance(value, int) else round(restored, 1)
 
 
 class SimulatedWallet:
-    def execute(self, state, action, autonomous):
+    """Balances and receipts kept in the workspace document; no chain, no signatures."""
+
+    mode = "simulated"
+
+    def prepare(self, state, fresh=False):
+        state["wallet"]["mode"] = self.mode
+
+    def record_decision(self, state, actor, decision_id, approved):
+        return None
+
+    def recover(self, state, operation, actor):
+        return None
+
+    def advance_time(self, state, seconds):
+        return None
+
+    def status(self, state):
+        return {"mode": self.mode, "connected": False}
+
+    def execute(self, state, action, autonomous, actor=None):
         if action.get("is_canary"):
             raise ValueError("Training canaries can never execute")
         if action.get("receipt"):

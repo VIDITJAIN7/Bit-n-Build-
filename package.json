@@ -9,6 +9,7 @@
   "scripts": {
     "setup": "npm install && python scripts/setup.py",
     "dev": "node scripts/dev.mjs",
+    "dev:chain": "node scripts/dev.mjs --chain",
     "dev:web": "npm run dev --workspace @workkite/web",
     "build": "npm run build --workspace @workkite/web",
     "test": "python scripts/test_api.py && npm run test --workspace @workkite/contracts",

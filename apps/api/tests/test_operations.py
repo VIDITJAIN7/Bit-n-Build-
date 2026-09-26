@@ -3,12 +3,16 @@ import random
 import sqlite3
 import time
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
+from averlock import main
 from averlock.adapters import AIReviewPlanner, SimulatedFeed, SimulatedWallet
 from averlock.main import create_app
 from averlock.policy import evaluate
+from averlock.repository import SQLiteRepository
 from averlock.seed import initial_state, migrate_state
+from averlock.service import OperationsService
 from fastapi.testclient import TestClient
 
 PHOTO = (
@@ -47,6 +51,28 @@ def test_local_sign_in_uses_server_configuration(monkeypatch, tmp_path):
             json={"email": "admin@company.local", "password": "wrong"},
         )
         assert denied.status_code == 401
+        # Non-ASCII input is a wrong password, not a server error.
+        accented = auth.post(
+            "/api/auth/login",
+            json={"email": "admin@company.local", "password": "sécret-välue"},
+        )
+        assert accented.status_code == 401
+
+
+def test_default_database_path_is_a_real_file_and_relative_paths_use_the_api_folder(
+    monkeypatch, tmp_path
+):
+    # Importing the module must not create or migrate the default database.
+    assert "app" not in vars(main)
+    monkeypatch.setattr(main, "API_ROOT", tmp_path)
+    monkeypatch.delenv("WORKKITE_DATABASE", raising=False)
+    monkeypatch.delenv("AVERLOCK_DATABASE", raising=False)
+    create_app(agent_interval=0)
+    assert (tmp_path / "data" / "averlock.db").is_file()
+    monkeypatch.setenv("WORKKITE_DATABASE", "./custom/workspace.db")
+    create_app(agent_interval=0)
+    assert (tmp_path / "custom" / "workspace.db").is_file()
+    assert not (tmp_path / "None").exists() and not Path("None").exists()
 
 
 def post(client, path, body=None, status=200, method="post"):
@@ -129,12 +155,41 @@ def test_ai_review_planner_only_adds_assessment_to_configured_proposals():
     state = initial_state()
     trigger = next(item for item in state["triggers"] if item["id"] == "trg-overheat")
     row = next(item for item in state["assets"] if item["id"] == "inv-07")
-    proposal = AIReviewPlanner(FixedReviewer()).propose(
-        {"state": state, "trigger": trigger, "record": row}
-    )[0]
+    context = {"state": state, "trigger": trigger, "record": row}
+    planner = AIReviewPlanner(FixedReviewer())
+    planner.prepare([context])
+    proposal = planner.propose(context)[0]
     assert proposal["kind"] == "work_order"
     assert proposal["ai_risk"]["score"] == 76
     assert proposal["title"] == "Inspect cooling on Inverter 07"
+    # A proposal the review never saw (the data changed in between) waits for a person.
+    unreviewed = planner.propose(context)[0]
+    assert unreviewed["ai_risk"]["available"] is False
+    assert not evaluate(state, {**unreviewed, "evidence": True})["auto_allowed"]
+
+
+def test_ai_review_runs_outside_the_database_write_lock(tmp_path):
+    path = tmp_path / "ai.db"
+
+    class LockProbe:
+        calls = 0
+
+        def review(self, context):
+            # If a write transaction were open, this would fail immediately.
+            with sqlite3.connect(path, timeout=0) as probe:
+                probe.execute("BEGIN IMMEDIATE")
+                probe.execute("ROLLBACK")
+            LockProbe.calls += 1
+            record = context["record"]
+            assert "fuel_pct" in record or "temperature_c" in record or "sku" in record
+            return {"score": 5, "flags": [], "explanation": "Routine.", "available": True}
+
+    service = OperationsService(SQLiteRepository(str(path)), agent=AIReviewPlanner(LockProbe()))
+    state, _ = service.cycle()
+    assert LockProbe.calls > 0
+    restock = next(a for a in state["actions"] if a["subject"]["id"] == "stk-x14-solar")
+    assert restock["ai_risk"]["available"] and restock["status"] == "executed"
+    assert not any("did not run" in " ".join(a["policy"]["reasons"]) for a in state["actions"])
 
 
 def test_scheduled_agent_route_requires_configured_bearer_secret(monkeypatch, tmp_path):
@@ -182,7 +237,7 @@ def decision(client, action_id, actor="supervisor", choice="approve", status=200
 def test_background_cycle_handles_routine_work_and_escalates_exceptions(client):
     state = cycle(client)
     fans = by_trigger(state, "trg-restock", "stk-x14-solar")[0]
-    assert fans["supplier"] == "Desert Supply" and fans["amount_cents"] == 13600
+    assert fans["supplier"] == "Desert Supply" and fans["amount_cents"] == 6800
     assert fans["status"] == "executed" and fans["execution_mode"] == "autonomous"
     assert "Solar Parts Co. is cheaper but takes 6 days" in fans["explanation"]
     pending = [a for a in state["actions"] if a["status"] == "pending"]
@@ -194,7 +249,7 @@ def test_background_cycle_handles_routine_work_and_escalates_exceptions(client):
     )
     assert state["stats"]["auto_handled"] == 6 and state["stats"]["alerts"] == 1
     assert any(t["subject_code"] == "FRZ-05" for t in state["field_tasks"])
-    assert state["wallet"]["balance_cents"] == 1500000 - 13600 - 9500 - 7800
+    assert state["wallet"]["balance_cents"] == 1500000 - 6800 - 9500 - 2600
     stock = {i["sku"]: i["stock"] for i in state["inventory"]}
     assert stock["X14"] == 2 and stock["BATT-C"] == 4 and stock["SEAL-G"] == 3
 
@@ -230,6 +285,20 @@ def test_custom_trigger_is_created_previewed_run_and_removed(client):
     task = next(t for t in state["field_tasks"] if t["trigger_id"] == trigger["id"])
     assert task["question"] == "Is BAT-01 charging?" and task["status"] == "open"
     assert task["assignee"] == "Alex Worker"
+
+
+def test_work_orders_go_to_the_rule_assignee_before_the_site_technician(client):
+    body = draft(
+        name="Battery work order",
+        action={"type": "work_order", "title": "Service {name}", "assignee": "Dana Crew"},
+    )
+    state = post(client, "/triggers", body)["state"]
+    trigger = next(t for t in state["triggers"] if t["name"] == "Battery work order")
+    state = cycle(client)
+    order = by_trigger(state, trigger["id"], "bat-01")[0]
+    task = next(t for t in state["field_tasks"] if t["action_id"] == order["id"])
+    assert task["assignee"] == "Dana Crew"
+    assert "assigned to Dana Crew" in order["explanation"]
     post(client, f"/triggers/{trigger['id']}/enabled", {"enabled": False})
     post(client, f"/triggers/{trigger['id']}/run", status=409)
     state = post(client, f"/triggers/{trigger['id']}", method="delete")["state"]
@@ -336,7 +405,7 @@ def test_replacement_requires_field_confirmation_then_single_supervisor(client):
     state = decision(client, action["id"])["state"]
     action = replacement(state)
     assert action["status"] == "executed" and len(action["approvals"]) == 1
-    assert state["wallet"]["balance_cents"] == 1500000 - 13600 - 9500 - 7800 - 470000
+    assert state["wallet"]["balance_cents"] == 1500000 - 6800 - 9500 - 2600 - 470000
     decision(client, action["id"], status=409)
 
 
@@ -657,3 +726,182 @@ def test_simulated_feed_is_bounded_and_reproducible():
     metrics = [m for a in first["assets"] for m in a["metrics"].items()]
     assert all(0 <= v <= 100 for k, v in metrics if k.endswith("_pct"))
     assert all(i["stock"] >= 0 for i in first["inventory"])
+
+
+def manual_purchases(client, amount_cents=30000, supplier_id="sup-desert"):
+    """A runbook that proposes one purchase per inventory record, for approval-flow tests."""
+    body = draft(
+        name="Bulk purchase runbook",
+        source="inventory",
+        mode="manual",
+        conditions=[],
+        action={
+            "type": "purchase",
+            "title": "Top up {name}",
+            "supplier_id": supplier_id,
+            "amount_cents": amount_cents,
+        },
+    )
+    state = post(client, "/triggers", body)["state"]
+    trigger = next(t for t in state["triggers"] if t["name"] == "Bulk purchase runbook")
+    state = post(client, f"/triggers/{trigger['id']}/run")["state"]
+    return [a for a in by_trigger(state, trigger["id"]) if a["status"] == "pending"]
+
+
+def test_backup_authority_is_capped_for_the_whole_absence(client):
+    filters = by_trigger(cycle(client), "trg-restock", "stk-p90-solar")[0]
+    post(client, "/demo/clock", {"hours": 4})
+    state = decision(client, filters["id"], actor="backup")["state"]
+    assert state["supervision"]["backup_remaining_cents"] == 500000 - 82000
+    large = manual_purchases(client, amount_cents=450000)[0]
+    response = client.post(
+        f"/api/actions/{large['id']}/decision", json={"actor": "backup", "decision": "approve"}
+    )
+    assert response.status_code == 409 and "limit for this absence" in response.json()["detail"]
+    # The owner's return ends the absence and restores the full stand-in budget.
+    state = decision(client, large["id"], actor="supervisor")["state"]
+    assert state["supervision"]["backup_remaining_cents"] == 500000
+    assert not state["supervision"]["backup_active"]
+
+
+def test_recovery_can_run_again_after_a_completed_recovery(client):
+    handovers = (
+        ("supervisor", "replacement-supervisor"),
+        ("replacement-supervisor", "supervisor"),
+    )
+    for owner, candidate in handovers:
+        post(client, "/demo/clock", {"hours": 168})
+        state = post(client, "/recovery", {"operation": "start"})["state"]
+        assert state["recovery"]["candidate"] == candidate and state["wallet"]["owner"] == owner
+        post(client, "/recovery", {"operation": "approve", "actor": "guardian-1"})
+        post(client, "/recovery", {"operation": "approve", "actor": "guardian-3"})
+        post(client, "/recovery", {"operation": "advance"})
+        state = post(client, "/recovery", {"operation": "finalize"})["state"]
+        assert state["wallet"]["owner"] == candidate and state["recovery"]["stage"] == "complete"
+
+
+def test_rapid_approvals_trigger_a_pace_check(client):
+    pending = manual_purchases(client)
+    assert len(pending) >= 4
+    for action in pending[:3]:
+        decision(client, action["id"])
+    state = client.get("/api/state").json()
+    assert state["supervision"]["readback"] == {"supervisor": "pace"}
+    response = client.post(
+        f"/api/actions/{pending[3]['id']}/decision",
+        json={"actor": "supervisor", "decision": "approve"},
+    )
+    assert response.status_code == 409 and "Pace check" in response.json()["detail"]
+    # Rejecting is never slowed down, and a correct readback clears the check.
+    decision(client, pending[3]["id"], readback="VENDOR-A")
+    assert client.get("/api/state").json()["supervision"]["readback"] == {}
+
+
+def test_anomaly_model_escalates_unusual_purchases_inside_every_limit(client):
+    state = cycle(client)
+    fans = by_trigger(state, "trg-restock", "stk-x14-solar")[0]
+    assert fans["status"] == "executed" and fans["ml"]["flagged"] is False
+    assert state["ml"]["model"] == "Isolation forest" and not state["ml"]["learning"]
+    assert "history" not in state and state["history_size"] > 100
+    # Same supplier, same destination, inside the $250 limit, but 32% above the usual price.
+    post(client, "/data/suppliers/sup-desert", {"catalog": {"X14": 9000}}, method="patch")
+    post(client, "/data/inventory/stk-x14-solar", {"stock": 1}, method="patch")
+    post(client, "/demo/clock", {"hours": 4})
+    state = cycle(client)
+    fans = by_trigger(state, "trg-restock", "stk-x14-solar")[-1]
+    assert fans["amount_cents"] == 9000 and fans["status"] == "pending"
+    assert fans["ml"]["flagged"] and "Unit price 32% above usual" in fans["ml"]["signals"]
+    reasons = fans["policy"]["reasons"]
+    assert any(reason.startswith("Unusual for this workspace") for reason in reasons)
+    assert state["stats"]["ml_flagged"] == 2  # this and the new-supplier replacement
+    assert any(e["event"] == "model.escalated" for e in state["audit"])
+
+
+def test_time_lapse_absorbs_routine_volume_and_keeps_the_owner_present(tmp_path):
+    service = OperationsService(
+        SQLiteRepository(str(tmp_path / "lapse.db")),
+        rng=random.Random(3),
+        feed=SimulatedFeed(random.Random(3)),
+    )
+    service.cycle()
+    _, message = service.time_lapse(720)
+    state = service.snapshot()
+    routed = [a for a in state["actions"] if a["status"] == "pending"]
+    assert "Fast-forwarded 30 days" in message
+    # A month of routine work reaches people as a handful of decisions, not dozens.
+    assert state["stats"]["auto_handled"] >= 25
+    assert len(routed) * 4 <= state["stats"]["auto_handled"]
+    assert state["agent"]["simulated_hours"] == 720
+    assert not state["supervision"]["backup_active"]
+    assert all(i["stock"] >= 0 for i in state["inventory"])
+
+
+def test_agent_budget_days_follow_the_simulation_clock(client):
+    service = client.app.state.service
+
+    def spend(state):
+        state["wallet"]["agent_spent_cents"] = 99000
+
+    service.repository.mutate(spend)
+    post(client, "/demo/clock", {"hours": 168})
+    fans = by_trigger(cycle(client), "trg-restock", "stk-x14-solar")[0]
+    assert fans["status"] == "executed"
+
+
+def incident(id="incident-unique-001", **overrides):
+    body = {
+        "id": id,
+        "site_id": "site-solar",
+        "kind": "heat",
+        "severity": "critical",
+        "note": "Crew member dizzy near INV-04",
+        "created_at": "2026-09-26T10:00:00+00:00",
+        "location": {"lat": 23.65, "lon": 53.7, "accuracy_m": 12},
+        "attachments": [
+            {"kind": "photo", "name": "scene.png", "data_url": PHOTO, "demo_fixture": False}
+        ],
+    }
+    body.update(overrides)
+    return body
+
+
+def test_field_incidents_are_logged_idempotently_and_acknowledged(client):
+    state = post(client, "/incidents", incident())["state"]
+    logged = state["incidents"][0]
+    assert logged["status"] == "open" and logged["attachments"][0]["sha256"]
+    assert "data_url" not in json.dumps(state["incidents"])
+    assert client.get("/api/incidents/incident-unique-001/media/photo").status_code == 200
+    # A retry from a device that lost its connection is accepted once, never duplicated.
+    assert "duplicate" in post(client, "/incidents", incident())["message"]
+    post(client, "/incidents", incident(note="changed"), 409)
+    post(client, "/incidents", incident(id="incident-unique-002", site_id="site-mars"), 409)
+    post(client, "/incidents", incident(id="incident-unique-003", attachments=[]))
+    state = post(
+        client, "/incidents/incident-unique-001/acknowledge", {"actor": "supervisor"}
+    )["state"]
+    acknowledged = next(i for i in state["incidents"] if i["id"] == "incident-unique-001")
+    assert acknowledged["status"] == "acknowledged"
+    assert acknowledged["acknowledged_by"] == "supervisor"
+    post(client, "/incidents/incident-unique-001/acknowledge", {"actor": "supervisor"}, 409)
+    assert state["stats"]["incidents"] == 2
+
+
+def test_practice_items_read_like_routine_restocks(client):
+    state = cycle(client)
+    pending_items = {a["subject"]["id"] for a in state["actions"] if a["status"] == "pending"}
+    post(client, "/drills", {"operation": "enable"})
+    for _ in range(3):
+        state = post(client, "/drills", {"operation": "inject"})["state"]
+        canary = state["actions"][-1]
+        item = canary["subject"]["id"].split("#")[0]
+        # Never a second order for an item that already has one waiting.
+        assert item not in pending_items
+        pending_items.add(item)
+        real = next(i for i in state["inventory"] if i["id"] == item)
+        quantity = max(real["reorder_to"] - real["stock"], real["minimum"] - real["stock"])
+        assert canary["quantity"] == quantity
+        assert f"ordering {quantity} to reach {real['stock'] + quantity}" in canary["explanation"]
+        assert canary["recipient"] not in state["policy"]["known_recipients"]
+    # The wallet refuses exercises even if something tried to execute one.
+    with pytest.raises(ValueError, match="never execute"):
+        SimulatedWallet().execute(state, {**canary, "is_canary": True}, False)

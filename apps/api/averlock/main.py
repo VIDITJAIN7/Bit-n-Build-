@@ -12,11 +12,17 @@ from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from .adapters import AIReviewPlanner, LocalPlanner, OpenAICompatibleRiskReviewer
+from .adapters import (
+    AIReviewPlanner,
+    LocalPlanner,
+    OpenAICompatibleRiskReviewer,
+    SimulatedWallet,
+)
 from .repository import SQLiteRepository
 from .service import DomainError, OperationsService
 
 logger = logging.getLogger("averlock.agent")
+API_ROOT = Path(__file__).resolve().parents[1]
 
 Code = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{0,23}$")]
 Key = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,31}$")]
@@ -185,6 +191,31 @@ class ClockAdvance(StrictModel):
     hours: Literal[4, 168]
 
 
+class TimeLapse(StrictModel):
+    hours: Literal[24, 168, 720]
+
+
+class Location(StrictModel):
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+    accuracy_m: float = Field(ge=0, le=100000)
+
+
+class Incident(StrictModel):
+    id: str = Field(min_length=8, max_length=100)
+    site_id: str = Field(min_length=1, max_length=60)
+    kind: Literal["injury", "fire", "electrical", "spill", "heat", "security", "other"]
+    severity: Literal["critical", "serious", "minor"]
+    note: str = Field(default="", max_length=1000)
+    created_at: str = Field(min_length=10, max_length=50)
+    location: Location | None = None
+    attachments: list[Attachment] = Field(default_factory=list, max_length=2)
+
+
+class Acknowledgement(StrictModel):
+    actor: Literal["supervisor", "backup", "replacement-supervisor"]
+
+
 class DrillOperation(StrictModel):
     operation: Literal["enable", "disable", "inject"]
 
@@ -240,22 +271,35 @@ def create_app(database_path=None, agent_interval=None):
         planner = AIReviewPlanner(reviewer)
     else:
         raise RuntimeError("WORKKITE_AGENT must be 'rules' or 'ai-risk'.")
-    if setting("WORKKITE_WALLET", "local", "AVERLOCK_WALLET") not in {"local", "simulated"}:
-        raise RuntimeError("External wallet adapter is not configured.")
+    wallet_mode = setting("WORKKITE_WALLET", "local", "AVERLOCK_WALLET").strip().lower()
+    if wallet_mode in {"local", "simulated"}:
+        wallet = SimulatedWallet()
+    elif wallet_mode == "local-chain":
+        from .chain import ChainWallet
+
+        wallet = ChainWallet(setting("WORKKITE_CHAIN_RPC", "http://127.0.0.1:8545"))
+    else:
+        raise RuntimeError("WORKKITE_WALLET must be 'local' or 'local-chain'.")
     interval = (
         float(setting("WORKKITE_AGENT_INTERVAL", "5", "AVERLOCK_AGENT_INTERVAL"))
         if agent_interval is None
         else agent_interval
     )
-    db = database_path or os.getenv(
-        setting(
-            "WORKKITE_DATABASE",
-            str(Path(__file__).parents[1] / "data" / "averlock.db"),
-            "AVERLOCK_DATABASE",
-        )
+    db = Path(
+        database_path
+        or setting("WORKKITE_DATABASE", str(API_ROOT / "data" / "averlock.db"), "AVERLOCK_DATABASE")
     )
-    service = OperationsService(SQLiteRepository(str(db)), agent=planner)
+    if not db.is_absolute():
+        # Relative paths in .env are relative to apps/api, whatever the working directory.
+        db = API_ROOT / db
+    service = OperationsService(SQLiteRepository(str(db)), agent=planner, wallet=wallet)
     service.interval = interval
+    try:
+        service.prepare()
+    except ValueError as error:
+        raise RuntimeError(
+            f"{error}. Start the local chain with npm run dev:chain, or set WORKKITE_WALLET=local."
+        ) from error
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -269,7 +313,7 @@ def create_app(database_path=None, agent_interval=None):
                     await task
 
     app = FastAPI(
-        title="Averlock local operations API",
+        title="Workkite local operations API",
         version="0.2.0",
         description="Local operations API. Authentication and wallet adapters are not configured; bind to loopback only.",
         lifespan=lifespan,
@@ -300,7 +344,7 @@ def create_app(database_path=None, agent_interval=None):
             "status": "ok",
             "mode": "local",
             "agent": service.agent.mode,
-            "wallet": "simulated",
+            "wallet": service.wallet.mode,
         }
 
     @app.post("/api/auth/login")
@@ -323,8 +367,11 @@ def create_app(database_path=None, agent_interval=None):
                 and isinstance(user.get("email"), str)
                 and isinstance(user.get("password"), str)
                 and user.get("role") in {"admin", "worker"}
-                and secrets.compare_digest(user["email"].strip().casefold(), email)
-                and secrets.compare_digest(user["password"], body.password)
+                # Compare bytes: compare_digest rejects non-ASCII str input with a TypeError.
+                and secrets.compare_digest(
+                    user["email"].strip().casefold().encode(), email.encode()
+                )
+                and secrets.compare_digest(user["password"].encode(), body.password.encode())
             ),
             None,
         )
@@ -350,7 +397,7 @@ def create_app(database_path=None, agent_interval=None):
         if not cron_secret:
             raise HTTPException(status_code=503, detail="Scheduled agent is not configured")
         supplied = authorization.removeprefix("Bearer ") if authorization else ""
-        if not secrets.compare_digest(supplied, cron_secret):
+        if not secrets.compare_digest(supplied.encode(), cron_secret.encode()):
             raise HTTPException(status_code=401, detail="Unauthorized scheduled request")
         return command(service.cycle)
 
@@ -412,7 +459,16 @@ def create_app(database_path=None, agent_interval=None):
     def report(body: Report):
         return command(lambda: service.submit_report(body.model_dump()))
 
+    @app.post("/api/incidents")
+    def incident(body: Incident):
+        return command(lambda: service.report_incident(body.model_dump()))
+
+    @app.post("/api/incidents/{incident_id}/acknowledge")
+    def acknowledge(incident_id: str, body: Acknowledgement):
+        return command(lambda: service.acknowledge_incident(incident_id, body.actor))
+
     @app.get("/api/reports/{report_id}/media/{kind}")
+    @app.get("/api/incidents/{report_id}/media/{kind}")
     def media(report_id: str, kind: Literal["photo", "audio"]):
         data_url = service.media(report_id, kind)
         if not data_url:
@@ -436,6 +492,10 @@ def create_app(database_path=None, agent_interval=None):
     def advance(body: ClockAdvance):
         return command(lambda: service.advance(body.hours))
 
+    @app.post("/api/demo/time-lapse")
+    def time_lapse(body: TimeLapse):
+        return command(lambda: service.time_lapse(body.hours))
+
     @app.post("/api/drills")
     def drills(body: DrillOperation):
         return command(lambda: service.drills(body.operation))
@@ -451,4 +511,11 @@ def create_app(database_path=None, agent_interval=None):
     return app
 
 
-app = create_app()
+def __getattr__(name):
+    # uvicorn loads averlock.main:app; build it on first access so importing this module
+    # (as the tests do) never creates or migrates the default database.
+    if name == "app":
+        global app
+        app = create_app()
+        return app
+    raise AttributeError(name)

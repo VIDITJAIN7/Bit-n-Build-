@@ -19,7 +19,9 @@ export function compile() {
     settings: {
       optimizer: { enabled: true, runs: 200 },
       evmVersion: "shanghai",
-      outputSelection: { "*": { "*": ["abi", "evm.bytecode.object"] } },
+      outputSelection: {
+        "*": { "*": ["abi", "evm.bytecode.object", "evm.methodIdentifiers"] },
+      },
     },
   };
   const output = JSON.parse(

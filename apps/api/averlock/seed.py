@@ -1,12 +1,32 @@
+import random
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+from .catalog import choose_supplier
 
 # Bump when the stored state shape changes; supported local states are migrated in place.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+WORKSPACE_NAME = "Workkite operations workspace"
+# Typical daily use of the seeded consumables; drives time-lapse consumption and history.
+DAILY_USAGE = {
+    "stk-x14-solar": 0.12,
+    "stk-p90-solar": 0.55,
+    "stk-a17-solar": 0.9,
+    "stk-g02-solar": 2.5,
+    "stk-batt-c-tower": 0.1,
+    "stk-fuel-20-tower": 1.6,
+    "stk-seal-g-cold": 0.25,
+    "stk-r404a-cold": 0.06,
+}
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def sim_now(state):
+    """The simulation clock: real time plus any demo fast-forward."""
+    return datetime.now(timezone.utc) + timedelta(seconds=state.get("clock_offset_seconds", 0))
 
 
 def blank_runtime():
@@ -71,21 +91,64 @@ def asset(code, site_id, name, kind, **metrics):
 
 
 def stock(sku, site_id, name, on_hand, minimum, reorder_to):
+    item_id = f"stk-{sku.lower()}-{site_id.removeprefix('site-')}"
     return {
-        "id": f"stk-{sku.lower()}-{site_id.removeprefix('site-')}",
+        "id": item_id,
         "site_id": site_id,
         "sku": sku,
         "name": name,
         "stock": on_hand,
         "minimum": minimum,
         "reorder_to": reorder_to,
+        "daily_usage": DAILY_USAGE.get(item_id, 0),
     }
 
 
+def purchase_history(state, days=120, seed=7):
+    """Synthetic past orders produced by the same usage-and-reorder rule the agent follows.
+
+    Built backwards from today's stock: the last delivery topped each item up to its reorder
+    level, and usage since then explains the current count. The anomaly model learns what
+    normal purchasing looks like from these records and every purchase executed afterwards.
+    """
+    rng = random.Random(seed)
+    now = datetime.now(timezone.utc)
+    sites = {site["id"]: site for site in state["sites"]}
+    records = []
+    for item in state["inventory"]:
+        usage = item.get("daily_usage") or 0
+        site = sites.get(item["site_id"])
+        supplier, _, _ = choose_supplier(state, item["sku"], site and site["next_visit_days"])
+        if not supplier or usage <= 0:
+            continue
+        price = supplier["catalog"][item["sku"]]
+        # The agent orders the moment stock dips below minimum, back up to the reorder level.
+        usual = max(item["reorder_to"] - item["minimum"] + 1, 1)
+        at = now - timedelta(days=max(item["reorder_to"] - item["stock"], 1) / usage)
+        while at > now - timedelta(days=days):
+            # Fast-moving items sometimes drop two below minimum before the order goes out.
+            quantity = usual + (1 if usage >= 1 and rng.random() < 0.3 else 0)
+            records.append(
+                {
+                    "at": at.isoformat(),
+                    "site_id": item["site_id"],
+                    "sku": item["sku"],
+                    "supplier_id": supplier["id"],
+                    "recipient": supplier["recipient"],
+                    "quantity": quantity,
+                    "unit_cents": price,
+                    "amount_cents": quantity * price,
+                    "source": "seeded history",
+                }
+            )
+            at -= timedelta(days=quantity / usage * rng.uniform(0.85, 1.15))
+    return sorted(records, key=lambda record: record["at"])
+
+
 def initial_state():
-    return {
+    state = {
         "schema_version": SCHEMA_VERSION,
-        "workspace": {"name": "Averlock operations workspace"},
+        "workspace": {"name": WORKSPACE_NAME},
         "sites": [
             {
                 "id": "site-solar",
@@ -178,13 +241,13 @@ def initial_state():
             ),
         ],
         "inventory": [
-            stock("X14", "site-solar", "Cooling fan", 0, 2, 2),
+            stock("X14", "site-solar", "Cooling fan", 1, 2, 2),
             stock("P90", "site-solar", "Air filter", 3, 5, 23),
             stock("A17", "site-solar", "Fuse", 14, 6, 20),
             stock("G02", "site-solar", "Safety gloves", 22, 8, 30),
             stock("BATT-C", "site-tower", "Battery cell", 3, 4, 4),
             stock("FUEL-20", "site-tower", "Diesel can (20 L)", 8, 6, 12),
-            stock("SEAL-G", "site-cold", "Door gasket", 0, 3, 3),
+            stock("SEAL-G", "site-cold", "Door gasket", 2, 3, 3),
             stock("R404A", "site-cold", "Refrigerant R404A", 2, 2, 3),
         ],
         "suppliers": [
@@ -394,6 +457,8 @@ def initial_state():
             "agent_per_action_cents": 25000,
             "agent_daily_cents": 100000,
             "supervisor_limit_cents": 500000,
+            # A stand-in backup approver's total spend while the owner is away.
+            "backup_absence_cents": 500000,
             "known_recipients": ["vendor-a", "vendor-b", "vendor-d", "vendor-e"],
             "typical_purchase_cents": 51000,
         },
@@ -409,13 +474,16 @@ def initial_state():
             "enabled": True,
             "live_feed": False,
             "cycles": 0,
+            "simulated_hours": 0,
             "last_cycle_at": None,
             "last_cycle_changes": 0,
         },
         "actions": [],
         "field_tasks": [],
         "reports": [],
+        "incidents": [],
         "audit": [],
+        "history": [],
         "counters": {"action": 0, "task": 0},
         "stats": {
             "auto_handled": 0,
@@ -424,6 +492,8 @@ def initial_state():
             "blocked": 0,
             "alerts": 0,
             "field_dispatched": 0,
+            "ml_flagged": 0,
+            "incidents": 0,
         },
         "clock_offset_seconds": 0,
         "supervision": {
@@ -431,8 +501,9 @@ def initial_state():
             "backup_after_seconds": 14400,
             "recovery_after_seconds": 604800,
             "backup": "backup",
+            "backup_spent_cents": 0,
         },
-        "drills": {"enabled": False, "rate": 0.03, "stats": {}},
+        "drills": {"enabled": False, "rate": 0.03, "stats": {}, "pace": {}},
         "weather": {
             "source": "local simulation",
             "scenario": "warm",
@@ -449,6 +520,8 @@ def initial_state():
             "unlock_at": None,
         },
     }
+    state["history"] = purchase_history(state)
+    return state
 
 
 def migrate_state(state):
@@ -480,7 +553,21 @@ def migrate_state(state):
         task.setdefault("assignee", "")
         task.setdefault("instructions", "")
         task.setdefault("priority", "normal")
-    if state.get("workspace", {}).get("name") == "Averlock demo workspace":
-        state["workspace"]["name"] = "Averlock operations workspace"
+    for item in state.get("inventory", []):
+        item.setdefault("daily_usage", DAILY_USAGE.get(item["id"], 0))
+    state.setdefault("policy", {}).setdefault("backup_absence_cents", 500000)
+    state.setdefault("supervision", {}).setdefault("backup_spent_cents", 0)
+    state.setdefault("drills", {}).setdefault("pace", {})
+    state.setdefault("stats", {}).setdefault("ml_flagged", 0)
+    state["stats"].setdefault("incidents", 0)
+    state.setdefault("incidents", [])
+    state.setdefault("agent", {}).setdefault("simulated_hours", 0)
+    if "history" not in state:
+        state["history"] = purchase_history(state)
+    if state.get("workspace", {}).get("name") in (
+        "Averlock demo workspace",
+        "Averlock operations workspace",
+    ):
+        state["workspace"]["name"] = WORKSPACE_NAME
     state["schema_version"] = SCHEMA_VERSION
     return state

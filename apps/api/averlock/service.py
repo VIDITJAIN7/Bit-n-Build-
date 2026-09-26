@@ -6,15 +6,21 @@ from uuid import uuid4
 
 from . import triggers as rules
 from .adapters import LocalPlanner, SimulatedFeed, SimulatedWallet
-from .policy import evaluate, refresh_daily_budget
-from .seed import blank_runtime, initial_state, now_iso
+from .anomaly import PurchaseModel, purchase_record
+from .policy import backup_remaining, evaluate, money, refresh_daily_budget
+from .seed import blank_runtime, initial_state, now_iso, sim_now
 
 MAX_ACTIONS = 300
 MAX_AUDIT = 400
 MAX_TASKS = 150
 MAX_REPORTS = 100
+MAX_INCIDENTS = 100
+MAX_HISTORY = 400
 NOUNS = {"sites": "Site", "assets": "Asset", "inventory": "Inventory item", "suppliers": "Supplier"}
 HOMOGLYPHS = (("o", "0"), ("l", "1"), ("i", "1"), ("e", "3"), ("a", "4"), ("s", "5"))
+# Rapid approvals earn a speed bump: after this many in the window, read back before approving.
+PACE_LIMIT = 3
+PACE_WINDOW_SECONDS = 30
 
 
 class DomainError(ValueError):
@@ -45,14 +51,42 @@ def find_action(state, action_id):
     return find(state["actions"], action_id, "Action")
 
 
-def recovery_now(state):
-    return datetime.now(timezone.utc) + timedelta(seconds=state["clock_offset_seconds"])
-
-
 def owner_silence(state):
     return (
-        recovery_now(state) - datetime.fromisoformat(state["supervision"]["last_owner_action"])
+        sim_now(state) - datetime.fromisoformat(state["supervision"]["last_owner_action"])
     ).total_seconds()
+
+
+def owner_acted(state):
+    """A primary-owner action: refreshes availability and ends any backup absence budget."""
+    state["supervision"]["last_owner_action"] = sim_now(state).isoformat()
+    state["supervision"]["backup_spent_cents"] = 0
+
+
+def recent_approvals(state, actor, now):
+    pace = state["drills"].setdefault("pace", {}).setdefault(actor, [])
+    return [
+        t for t in pace if (now - datetime.fromisoformat(t)).total_seconds() < PACE_WINDOW_SECONDS
+    ]
+
+
+def media_meta(attachments):
+    """What the workspace document keeps about evidence; the bytes live in the media table."""
+    return [
+        {
+            "kind": item["kind"],
+            "name": item["name"],
+            "demo_fixture": item["demo_fixture"],
+            "sha256": hashlib.sha256(item["data_url"].encode()).hexdigest(),
+            "bytes": len(item["data_url"].split(",", 1)[-1]) * 3 // 4,
+        }
+        for item in attachments
+    ]
+
+
+def readback_target(action):
+    """What a reviewer must type when a readback is required: where money goes, else the asset."""
+    return action.get("recipient") or action["subject"]["code"]
 
 
 def plural(count, noun):
@@ -79,30 +113,41 @@ def lookalike(recipient):
 
 
 class OperationsService:
-    def __init__(self, repository, agent=None, wallet=None, feed=None, rng=None):
+    def __init__(self, repository, agent=None, wallet=None, feed=None, rng=None, model=None):
         self.repository = repository
         self.agent = agent or LocalPlanner()
         self.wallet = wallet or SimulatedWallet()
         self.random = rng or random.Random()
         self.feed = feed or SimulatedFeed(self.random)
+        self.model = model or PurchaseModel()
         self.interval = 0
+
+    def prepare(self):
+        """Connect the wallet adapter (deploying the contracts on a fresh local chain)."""
+
+        def change(state):
+            self.wallet.prepare(state)
+            return f"Wallet ready ({self.wallet.mode})."
+
+        return self.repository.mutate(change)
 
     # Background agent ---------------------------------------------------------------
 
     def cycle(self):
         """One background pass: the optional sensor feed, then every enabled automatic trigger."""
-        if not self.repository.read()["agent"]["enabled"]:
+        state = self.repository.read()
+        if not state["agent"]["enabled"]:
             return None, "The background agent is paused."
+        if state["agent"]["live_feed"]:
+            # Readings move in their own short transaction, so a risk review running ahead
+            # of the trigger pass sees the data that pass will evaluate.
+            state, _ = self.repository.mutate(self.feed.step)
+        self._review_ahead(state, lambda trigger: trigger["enabled"] and trigger["mode"] == "auto")
 
         def change(state):
             agent = state["agent"]
             refresh_daily_budget(state)
-            if agent["live_feed"]:
-                self.feed.step(state)
-            created = 0
-            for trigger in state["triggers"]:
-                if trigger["enabled"] and trigger["mode"] == "auto":
-                    created += self._evaluate(state, trigger, manual=False)
+            created = self._evaluate_all(state)
             agent["cycles"] += 1
             agent["last_cycle_at"] = now_iso()
             agent["last_cycle_changes"] = created
@@ -111,10 +156,63 @@ class OperationsService:
 
         return self.repository.mutate(change)
 
-    def _evaluate(self, state, trigger, manual):
+    def _evaluate_all(self, state, planner=None):
+        created = 0
+        for trigger in state["triggers"]:
+            if trigger["enabled"] and trigger["mode"] == "auto":
+                created += self._evaluate(state, trigger, manual=False, planner=planner)
+        return created
+
+    def time_lapse(self, hours):
+        """Fast-forward normal operations an hour at a time with the supervisor around.
+
+        Usage, wear, and completed work come from the simulated feed; every proposal still
+        crosses the same policy gate and anomaly model. The queue shows what a day or a week
+        of operations would have asked of a person. Simulated hours use the local planner:
+        an optional AI reviewer is only called for real cycles.
+        """
+        planner = getattr(self.agent, "planner", self.agent)
+
+        def change(state):
+            stats = state["stats"]
+            before = {key: stats[key] for key in ("auto_handled", "alerts", "field_dispatched")}
+            known = {action["id"] for action in state["actions"]}
+            for _ in range(hours):
+                state["clock_offset_seconds"] += 3600
+                self.wallet.advance_time(state, 3600)
+                refresh_daily_budget(state)
+                self.feed.step(state, hours=1)
+                self._evaluate_all(state, planner=planner)
+            # A normal stretch of operations: the supervisor kept working throughout.
+            owner_acted(state)
+            self.wallet.record_decision(state, state["wallet"]["owner"], "presence-heartbeat", True)
+            state["agent"]["simulated_hours"] += hours
+            fresh = [action for action in state["actions"] if action["id"] not in known]
+            review = [action for action in fresh if action["status"] == "pending"]
+            flagged = sum(1 for action in review if (action.get("ml") or {}).get("flagged"))
+            handled = stats["auto_handled"] - before["auto_handled"]
+            span = f"{hours // 24} days" if hours >= 48 else f"{hours} hours"
+            message = (
+                f"Fast-forwarded {span}: {plural(handled, 'routine action')} handled "
+                f"autonomously, {len(review)} routed to people"
+            )
+            if flagged:
+                message += f" ({flagged} escalated by the anomaly model)"
+            message += (
+                f", {plural(stats['alerts'] - before['alerts'], 'alert')}, "
+                f"{plural(stats['field_dispatched'] - before['field_dispatched'], 'worker task')}."
+            )
+            record(state, "demo.time_lapse", message, "demo-operator")
+            self._trim(state)
+            return message
+
+        return self.repository.mutate(change)
+
+    def _evaluate(self, state, trigger, manual, planner=None):
         """Edge-triggered: a record fires when it starts matching, once per cooldown window."""
+        planner = planner or self.agent
         runtime = trigger["runtime"]
-        now = recovery_now(state)
+        now = sim_now(state)
         rows = rules.evaluate(state, trigger)
         created = 0
         for row in rows:
@@ -124,15 +222,9 @@ class OperationsService:
             if self._has_open_item(state, trigger["id"], record_id):
                 runtime["firing"].setdefault(record_id, now.isoformat())
                 continue
-            last = runtime["last_fired"].get(record_id)
-            cooldown = trigger["cooldown_minutes"] * 60
-            if (
-                not manual
-                and last
-                and (now - datetime.fromisoformat(last)).total_seconds() < cooldown
-            ):
+            if self._cooling_down(trigger, record_id, now, manual):
                 continue
-            for proposal in self.agent.propose({"state": state, "trigger": trigger, "record": row}):
+            for proposal in planner.propose({"state": state, "trigger": trigger, "record": row}):
                 self._admit(state, proposal, trigger)
                 created += 1
             runtime["firing"][record_id] = now.isoformat()
@@ -152,6 +244,38 @@ class OperationsService:
         runtime["matches"] = current
         runtime["evaluated_at"] = now_iso()
         return created
+
+    @staticmethod
+    def _cooling_down(trigger, record_id, now, manual):
+        last = trigger["runtime"]["last_fired"].get(record_id)
+        return (
+            not manual
+            and last is not None
+            and (now - datetime.fromisoformat(last)).total_seconds()
+            < trigger["cooldown_minutes"] * 60
+        )
+
+    def _review_ahead(self, state, selected, manual=False):
+        """Give an optional risk reviewer the records about to fire, outside any transaction.
+
+        Provider calls can take seconds; holding the SQLite write lock that long would stall
+        approvals and worker reports. Proposals the review did not cover wait for a person.
+        """
+        prepare = getattr(self.agent, "prepare", None)
+        if not prepare:
+            return
+        now = sim_now(state)
+        prepare(
+            [
+                {"state": state, "trigger": trigger, "record": row}
+                for trigger in state["triggers"]
+                if selected(trigger)
+                for row in rules.evaluate(state, trigger)
+                if (manual or row["id"] not in trigger["runtime"]["firing"])
+                and not self._has_open_item(state, trigger["id"], row["id"])
+                and not self._cooling_down(trigger, row["id"], now, manual)
+            ]
+        )
 
     @staticmethod
     def _has_open_item(state, trigger_id, record_id):
@@ -179,6 +303,10 @@ class OperationsService:
             "field_confirmed": None,
             "receipt": None,
         }
+        if action["kind"] == "purchase":
+            action["ml"] = self.model.assess(state, action, sim_now(state))
+            if action["ml"]["flagged"]:
+                state["stats"]["ml_flagged"] += 1
         action["policy"] = evaluate(state, action)
         action["status"] = "blocked" if action["policy"]["hard_blocks"] else "pending"
         state["actions"].append(action)
@@ -198,6 +326,14 @@ class OperationsService:
             record(
                 state, "action.blocked", f"{action['title']} — {reasons}", "policy", action["id"]
             )
+        elif outcome == "review" and (action.get("ml") or {}).get("flagged"):
+            record(
+                state,
+                "model.escalated",
+                f"{action['title']}: {'; '.join(action['ml']['signals'])}",
+                "anomaly-model",
+                action["id"],
+            )
         if trigger:
             trigger["runtime"]["stats"][outcome] += 1
         if state["drills"]["enabled"] and self.random.random() < state["drills"]["rate"]:
@@ -207,11 +343,13 @@ class OperationsService:
     def execute(self, state, action, autonomous=False, actor="agent"):
         # Recheck at the moment of execution, inside the repository transaction.
         refresh_daily_budget(state)
-        policy = evaluate(state, action)
-        if policy["hard_blocks"] or (autonomous and not policy["auto_allowed"]):
-            raise DomainError("Current policy does not allow this execution")
-        kind = action["kind"]
         actor = "agent" if autonomous else actor
+        policy = evaluate(state, action, actor=None if autonomous else actor)
+        if policy["hard_blocks"] or (autonomous and not policy["auto_allowed"]):
+            raise DomainError(
+                "; ".join(policy["hard_blocks"]) or "Current policy does not allow this execution"
+            )
+        kind = action["kind"]
         outcome = {
             "purchase": "simulated payment",
             "work_order": "work order created",
@@ -219,7 +357,20 @@ class OperationsService:
             "notify": "alert raised",
         }[kind]
         if kind == "purchase":
-            action["receipt"] = self.wallet.execute(state, action, autonomous)
+            receipt = self.wallet.execute(state, action, autonomous, actor)
+            action["receipt"] = receipt
+            if receipt.get("tx"):
+                outcome = (
+                    f"paid on the local chain · tx {receipt['tx'][:10]}… block {receipt['block']}"
+                )
+            if actor == "backup":
+                state["supervision"]["backup_spent_cents"] = (
+                    state["supervision"].get("backup_spent_cents", 0) + action["amount_cents"]
+                )
+            state["history"] = [
+                *state["history"],
+                {**purchase_record(action), "at": sim_now(state).isoformat(), "source": "executed"},
+            ][-MAX_HISTORY:]
             item = next(
                 (i for i in state["inventory"] if i["id"] == action.get("restock_item_id")), None
             )
@@ -235,6 +386,7 @@ class OperationsService:
         action["status"] = "executed"
         action["execution_mode"] = "autonomous" if autonomous else "human"
         action["executed_at"] = now_iso()
+        action["executed_sim_at"] = sim_now(state).isoformat()
         if not autonomous:
             state["stats"]["human_executed"] += 1
         elif kind != "notify":
@@ -294,6 +446,9 @@ class OperationsService:
         )
         state["field_tasks"] = keep_latest(
             state["field_tasks"], MAX_TASKS, lambda t: t["status"] == "open"
+        )
+        state["incidents"] = keep_latest(
+            state["incidents"], MAX_INCIDENTS, lambda i: i["status"] == "open"
         )
         state["audit"] = state["audit"][-MAX_AUDIT:]
         state["reports"] = state["reports"][-MAX_REPORTS:]
@@ -427,6 +582,12 @@ class OperationsService:
         return self.repository.mutate(change)
 
     def run_trigger(self, trigger_id):
+        self._review_ahead(
+            self.repository.read(),
+            lambda trigger: trigger["id"] == trigger_id and trigger["enabled"],
+            manual=True,
+        )
+
         def change(state):
             trigger = find(state["triggers"], trigger_id, "Trigger")
             if not trigger["enabled"]:
@@ -590,18 +751,32 @@ class OperationsService:
             if action["status"] != "pending":
                 raise DomainError("This action is no longer awaiting a decision")
             stats = state["drills"]["stats"].get(actor, {})
+            real_now = datetime.now(timezone.utc)
+            recent = recent_approvals(state, actor, real_now)
+            pace_check = decision == "approve" and len(recent) >= PACE_LIMIT
+            what = "payment destination" if action.get("recipient") else "equipment code"
             if (
                 decision == "approve"
-                and stats.get("enhanced", False)
-                and readback.strip() != action.get("recipient", "internal")
+                and (stats.get("enhanced", False) or pace_check)
+                and readback.strip().casefold() != readback_target(action).casefold()
             ):
-                raise DomainError("Enhanced review: read back the exact payment destination")
+                if stats.get("enhanced", False):
+                    raise DomainError(f"Enhanced review: type the exact {what} to approve")
+                raise DomainError(
+                    f"Pace check: {PACE_LIMIT} approvals in under {PACE_WINDOW_SECONDS} seconds. "
+                    f"Type the exact {what} to continue."
+                )
+            if decision == "approve":
+                # A readback resets the pace window; otherwise remember this approval's time.
+                state["drills"]["pace"][actor] = (
+                    [] if pace_check else [*recent, real_now.isoformat()]
+                )
             if is_owner:
-                state["supervision"]["last_owner_action"] = recovery_now(state).isoformat()
+                owner_acted(state)
                 record(
                     state,
                     "supervision.owner_action",
-                    "Primary supervisor action refreshed the availability clock (simulated signature).",
+                    "Primary supervisor action refreshed the availability clock.",
                     actor,
                 )
             if action.get("is_canary"):
@@ -624,6 +799,7 @@ class OperationsService:
                     actor,
                     action_id,
                 )
+                self.wallet.record_decision(state, actor, action_id, not caught)
                 return (
                     "Training reveal: "
                     + (
@@ -640,9 +816,10 @@ class OperationsService:
                     if task["action_id"] == action_id and task["status"] == "open":
                         task["status"] = "cancelled"
                 record(state, "action.rejected", action["title"], actor, action_id)
+                self.wallet.record_decision(state, actor, action_id, False)
                 return "Action rejected. No funds moved."
             refresh_daily_budget(state)
-            policy = evaluate(state, action)
+            policy = evaluate(state, action, actor=actor)
             if policy["hard_blocks"]:
                 raise DomainError("; ".join(policy["hard_blocks"]))
             if action.get("requires_field_check") and action.get("field_confirmed") is not True:
@@ -653,6 +830,18 @@ class OperationsService:
             record(state, "action.approved", action["title"], actor, action_id)
             if len(action["approvals"]) >= policy["required_approvals"]:
                 self.execute(state, action, actor=actor)
+                receipt = action.get("receipt") or {}
+                if is_owner and not receipt:
+                    # No payment signed this approval, so record the owner's presence on chain.
+                    self.wallet.record_decision(state, actor, action_id, True)
+                if receipt.get("tx"):
+                    return (
+                        f"Authorized and paid on the local chain: tx {receipt['tx'][:10]}… "
+                        f"in block {receipt['block']}."
+                    )
+                if actor == "backup" and action["amount_cents"]:
+                    left = money(backup_remaining(state))
+                    return f"Approved by the backup. {left} of backup authority left this absence."
                 return "Required approvals received. Local execution completed."
             return "Approval recorded. A separate second authorizer is required."
 
@@ -675,21 +864,11 @@ class OperationsService:
         return self.repository.mutate(change)
 
     def submit_report(self, report):
-        attachments, blobs = [], []
-        for item in report["attachments"]:
-            attachments.append(
-                {
-                    "kind": item["kind"],
-                    "name": item["name"],
-                    "demo_fixture": item["demo_fixture"],
-                    "sha256": hashlib.sha256(item["data_url"].encode()).hexdigest(),
-                    "bytes": len(item["data_url"].split(",", 1)[-1]) * 3 // 4,
-                }
-            )
-            blobs.append(
-                (f"{report['id']}:{item['kind']}", report["id"], item["kind"], item["data_url"])
-            )
-        entry = {**report, "attachments": attachments}
+        blobs = [
+            (f"{report['id']}:{item['kind']}", report["id"], item["kind"], item["data_url"])
+            for item in report["attachments"]
+        ]
+        entry = {**report, "attachments": media_meta(report["attachments"])}
 
         def change(state):
             existing = next((r for r in state["reports"] if r["id"] == report["id"]), None)
@@ -788,8 +967,69 @@ class OperationsService:
 
         return self.repository.mutate(change, blobs=blobs)
 
-    def media(self, report_id, kind):
-        return self.repository.blob(f"{report_id}:{kind}")
+    def report_incident(self, incident):
+        """An unscheduled emergency or safety report from the field; never waits for a task."""
+        blobs = [
+            (f"{incident['id']}:{item['kind']}", incident["id"], item["kind"], item["data_url"])
+            for item in incident["attachments"]
+        ]
+        entry = {**incident, "attachments": media_meta(incident["attachments"])}
+
+        def change(state):
+            existing = next((i for i in state["incidents"] if i["id"] == incident["id"]), None)
+            if existing:
+                if any(existing.get(key) != entry[key] for key in entry):
+                    raise DomainError("An incident with this ID already contains different data")
+                return "Incident already received; duplicate retry ignored."
+            site = find(state["sites"], incident["site_id"], "Site")
+            kinds = [a["kind"] for a in incident["attachments"]]
+            if len(set(kinds)) != len(kinds):
+                raise DomainError("Attach at most one photo and one audio note")
+            if any(
+                (a["kind"] == "photo") != a["data_url"].startswith("data:image/")
+                for a in incident["attachments"]
+            ):
+                raise DomainError("Attachment type does not match its content type")
+            state["incidents"].append(
+                {
+                    **entry,
+                    "status": "open",
+                    "received_at": now_iso(),
+                    "acknowledged_by": None,
+                    "acknowledged_at": None,
+                }
+            )
+            state["stats"]["incidents"] += 1
+            record(
+                state,
+                "incident.reported",
+                f"{incident['severity'].capitalize()} {incident['kind']} incident "
+                f"at {site['name']}",
+                "technician",
+            )
+            self._trim(state)
+            return "Incident received. Supervisors see it at the top of the overview."
+
+        return self.repository.mutate(change, blobs=blobs)
+
+    def acknowledge_incident(self, incident_id, actor):
+        def change(state):
+            incident = find(state["incidents"], incident_id, "Incident")
+            if incident["status"] != "open":
+                raise DomainError("This incident has already been acknowledged")
+            incident.update(status="acknowledged", acknowledged_by=actor, acknowledged_at=now_iso())
+            record(
+                state,
+                "incident.acknowledged",
+                f"{incident['kind'].capitalize()} incident acknowledged",
+                actor,
+            )
+            return "Incident acknowledged. The worker's device shows it on the next sync."
+
+        return self.repository.mutate(change)
+
+    def media(self, owner_id, kind):
+        return self.repository.blob(f"{owner_id}:{kind}")
 
     # Authority, drills, and simulation controls ------------------------------------
 
@@ -798,15 +1038,22 @@ class OperationsService:
             recovery = state["recovery"]
             stage = recovery["stage"]
             if operation == "start":
-                if stage != "idle":
-                    raise DomainError("A recovery is already active or completed")
+                if stage in ("voting", "timelock"):
+                    raise DomainError("A recovery is already in progress")
                 if owner_silence(state) < state["supervision"]["recovery_after_seconds"]:
+                    days = state["supervision"]["recovery_after_seconds"] // 86400
                     raise DomainError(
-                        "Long-term recovery becomes eligible after 7 days without primary-supervisor actions"
+                        f"Long-term recovery becomes eligible after {days} days without "
+                        "primary-supervisor actions"
                     )
-                recovery.update(
-                    stage="voting", candidate="replacement-supervisor", approvals=[], unlock_at=None
+                # Authority passes to the other designated supervisor, never to a guardian or
+                # the backup, so recovery can run again after a completed one.
+                candidate = (
+                    "supervisor"
+                    if state["wallet"]["owner"] == "replacement-supervisor"
+                    else "replacement-supervisor"
                 )
+                recovery.update(stage="voting", candidate=candidate, approvals=[], unlock_at=None)
             elif operation == "approve":
                 if (
                     stage != "voting"
@@ -818,19 +1065,19 @@ class OperationsService:
                 if len(recovery["approvals"]) >= recovery["quorum"]:
                     recovery["stage"] = "timelock"
                     recovery["unlock_at"] = (
-                        recovery_now(state) + timedelta(seconds=recovery["delay_seconds"])
+                        sim_now(state) + timedelta(seconds=recovery["delay_seconds"])
                     ).isoformat()
             elif operation == "advance":
                 if stage != "timelock":
                     raise DomainError("Guardian quorum must start the timelock first")
                 state["clock_offset_seconds"] += recovery["delay_seconds"]
             elif operation == "finalize":
-                if stage != "timelock" or recovery_now(state) < datetime.fromisoformat(
+                if stage != "timelock" or sim_now(state) < datetime.fromisoformat(
                     recovery["unlock_at"]
                 ):
                     raise DomainError("Guardian quorum and the full timelock are required")
                 state["wallet"]["owner"] = recovery["candidate"]
-                state["supervision"]["last_owner_action"] = recovery_now(state).isoformat()
+                owner_acted(state)
                 recovery["stage"] = "complete"
                 # Old-owner approvals must not survive a change of authority.
                 for action in state["actions"]:
@@ -840,70 +1087,76 @@ class OperationsService:
                 if actor != state["wallet"]["owner"] or stage not in ("voting", "timelock"):
                     raise DomainError("Only the current owner can cancel an active recovery")
                 recovery.update(stage="idle", candidate=None, approvals=[], unlock_at=None)
-                state["supervision"]["last_owner_action"] = recovery_now(state).isoformat()
+                owner_acted(state)
             else:
                 raise DomainError("Unknown recovery operation")
+            self.wallet.recover(state, operation, actor)
             record(
                 state,
                 "recovery." + operation,
                 f"Recovery {operation}; authority: {state['wallet']['owner']}",
                 actor or "demo-operator",
             )
-            return "Recovery state updated in the local simulator."
+            return "Recovery state updated."
 
         return self.repository.mutate(change)
 
     def advance(self, hours):
         def change(state):
             state["clock_offset_seconds"] += hours * 3600
+            self.wallet.advance_time(state, hours * 3600)
             record(state, "demo.clock", f"Advanced availability simulation by {hours} hours.")
             return "Simulation clock advanced. No real time or funds changed."
 
         return self.repository.mutate(change)
 
     def add_canary(self, state):
-        """Insert a non-executable payment whose destination imitates a known supplier."""
+        """Insert a non-executable restock that pays a lookalike of a known supplier.
+
+        The local planner writes it exactly as it would write a real restock (quantity,
+        supplier choice, explanation) for an item with no order already waiting, so the
+        payment destination is the only thing that differs from routine work.
+        """
         known = set(state["policy"]["known_recipients"])
-        limit = state["policy"]["agent_per_action_cents"]
-        options = [
-            (supplier, item)
-            for supplier in state["suppliers"]
-            if supplier["approved"] and supplier["recipient"] in known
-            for item in state["inventory"]
-            if 0 < supplier["catalog"].get(item["sku"], 0) * 2 <= limit
-        ]
-        if not options:
-            return None
-        supplier, item = self.random.choice(options)
-        site = next((s for s in state["sites"] if s["id"] == item["site_id"]), {"name": "the site"})
-        restock = next((t for t in state["triggers"] if t["action"]["type"] == "restock"), None)
-        quantity = 2
-        action = {
-            "id": self._next_id(state, "action", "act"),
-            "kind": "purchase",
-            "title": f"Order {quantity} × {item['name']}",
-            "trigger_id": restock["id"] if restock else None,
-            "trigger_name": restock["name"] if restock else "Supplier invoice",
-            "site_id": item["site_id"],
-            "subject": {
+        restock = next(
+            (t for t in state["triggers"] if t["action"]["type"] == "restock"),
+            {
+                "id": None,
+                "name": "Restock below minimum",
                 "source": "inventory",
-                "id": f"{item['id']}#review",
-                "code": item["sku"],
-                "label": item["name"],
+                "conditions": [],
+                "match": "all",
+                "action": {"type": "restock"},
             },
-            "sku": item["sku"],
-            "quantity": quantity,
-            "amount_cents": quantity * supplier["catalog"][item["sku"]],
-            "supplier_id": supplier["id"],
-            "supplier": supplier["name"],
-            "recipient": lookalike(supplier["recipient"]),
-            "canary_expected": supplier["recipient"],
-            "evidence": True,
-            "requires_field_check": False,
-            "field_question": "",
-            "explanation": f"{item['name']} ({item['sku']}) at {site['name']} has {item['stock']} on "
-            f"hand against a minimum of {item['minimum']}; ordering {quantity}. {supplier['name']} "
-            f"is the lowest-priced approved supplier arriving in {supplier['lead_days']} days.",
+        )
+        waiting = {
+            a["subject"]["id"].split("#")[0] for a in state["actions"] if a["status"] == "pending"
+        }
+        approved = {s["id"] for s in state["suppliers"] if s["approved"]}
+        options = {True: [], False: []}
+        for row in rules.records(state, "inventory"):
+            if row["id"] in waiting:
+                continue
+            context = {"state": state, "trigger": restock, "record": row}
+            for proposal in LocalPlanner().propose(context):
+                if (
+                    proposal["kind"] == "purchase"
+                    and proposal.get("supplier_id") in approved
+                    and proposal.get("recipient") in known
+                ):
+                    # Items genuinely below minimum make the most ordinary-looking reorder.
+                    options[row["shortfall"] > 0].append(proposal)
+        pool = options[True] or options[False]
+        if not pool:
+            return None
+        proposal = self.random.choice(pool)
+        action = {
+            **proposal,
+            "id": self._next_id(state, "action", "act"),
+            # A distinct subject keeps the exercise from blocking the item's real restock.
+            "subject": {**proposal["subject"], "id": f"{proposal['subject']['id']}#review"},
+            "recipient": lookalike(proposal["recipient"]),
+            "canary_expected": proposal["recipient"],
             "is_canary": True,
             "created_at": now_iso(),
             "approvals": [],
@@ -913,6 +1166,8 @@ class OperationsService:
             "receipt": None,
             "status": "pending",
         }
+        # Same model assessment as a real proposal, so nothing marks the exercise out.
+        action["ml"] = self.model.assess(state, action, sim_now(state))
         action["policy"] = evaluate(state, action)
         state["actions"].append(action)
         record(state, "action.proposed", action["title"], "agent", action["id"])
@@ -952,6 +1207,8 @@ class OperationsService:
         def change(state):
             state.clear()
             state.update(initial_state())
+            # A fresh chain wallet too: action IDs restart, and the contract refuses reuse.
+            self.wallet.prepare(state, fresh=True)
             record(state, "demo.reset", "Local workspace, triggers, and wallet reset.")
             return "Local demo reset. The background agent starts over on its next cycle."
 
@@ -961,12 +1218,25 @@ class OperationsService:
 
     def snapshot(self):
         state = self.repository.read()
-        state["recovery"]["now"] = recovery_now(state).isoformat()
+        state["recovery"]["now"] = sim_now(state).isoformat()
         silence = owner_silence(state)
         supervision = state["supervision"]
         supervision["silence_hours"] = round(silence / 3600, 2)
         supervision["backup_active"] = silence >= supervision["backup_after_seconds"]
         supervision["recovery_eligible"] = silence >= supervision["recovery_after_seconds"]
+        supervision["backup_remaining_cents"] = backup_remaining(state)
+        real_now = datetime.now(timezone.utc)
+        # Who must type a readback on their next approval, and why.
+        supervision["readback"] = {
+            actor: "pace"
+            for actor in state["drills"].get("pace", {})
+            if len(recent_approvals(state, actor, real_now)) >= PACE_LIMIT
+        } | {
+            actor: "enhanced"
+            for actor, stats in state["drills"]["stats"].items()
+            if stats.get("enhanced")
+        }
+        supervision["pace"] = {"limit": PACE_LIMIT, "window_seconds": PACE_WINDOW_SECONDS}
         for action in state["actions"]:
             if action["status"] == "pending":
                 action.pop("is_canary", None)
@@ -978,4 +1248,11 @@ class OperationsService:
         state["schema"] = rules.schema(state)
         state["agent"]["interval_seconds"] = self.interval
         state["agent"]["planner"] = getattr(self.agent, "mode", "rules")
+        # The purchase history trains the model; the panel only needs its summary.
+        state["ml"] = self.model.status(state["history"])
+        state["history_size"] = len(state.pop("history"))
+        chain = self.wallet.status(state)
+        if chain.get("connected"):
+            state["wallet"]["balance_cents"] = chain["balance_cents"]
+        state["chain"] = chain
         return state

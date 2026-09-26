@@ -15,6 +15,10 @@ contract OperatingWallet is ReentrancyGuard {
     uint256 public constant AGENT_TX_LIMIT = 250 * 1e6;
     uint256 public constant AGENT_DAILY_LIMIT = 1_000 * 1e6;
     uint256 public constant SUPERVISOR_TX_LIMIT = 5_000 * 1e6;
+    /// @notice Total a stand-in backup may spend while the owner is away. It resets only when
+    ///         the owner acts again or recovery installs a new owner, so a backup key cannot
+    ///         drain the wallet over a long absence one day at a time.
+    uint256 public constant BACKUP_ABSENCE_LIMIT = 5_000 * 1e6;
     uint256 public constant BACKUP_DELAY = 4 hours;
     uint256 public constant RECOVERY_SILENCE = 7 days;
     uint256 public constant RECOVERY_DELAY = 48 hours;
@@ -22,12 +26,13 @@ contract OperatingWallet is ReentrancyGuard {
 
     IERC20 public immutable token;
     address public owner;
-    address public immutable agent;
-    address public immutable backup;
+    address public agent;
+    address public backup;
     uint256 public lastOwnerAction;
     bool public agentEnabled = true;
     mapping(address => bool) public approvedRecipients;
     mapping(uint256 => uint256) public agentSpendByDay;
+    uint256 public backupSpentThisAbsence;
     mapping(address => bool) public isGuardian;
     mapping(bytes32 => bool) public usedActionIds;
 
@@ -40,6 +45,7 @@ contract OperatingWallet is ReentrancyGuard {
     event Executed(bytes32 indexed actionId, address indexed signer, address recipient, uint256 amount, bool autonomous);
     event OwnerAction(address indexed owner, bytes32 indexed decisionId, bool approved);
     event RecipientPolicy(address indexed recipient, bool allowed);
+    event RoleUpdated(bytes32 indexed role, address indexed previous, address indexed current);
     event RecoveryStarted(uint256 indexed nonce, address indexed candidate);
     event RecoveryApproved(uint256 indexed nonce, address indexed guardian, uint256 votes);
     event RecoveryCancelled(uint256 indexed nonce);
@@ -53,10 +59,14 @@ contract OperatingWallet is ReentrancyGuard {
         require(owner_ != agent_ && backup_ != agent_ && owner_ != backup_, "distinct operating roles");
         require(IERC20Metadata(token_).decimals() == 6, "six decimal token required");
         token = IERC20(token_); owner = owner_; agent = agent_; backup = backup_;
-        lastOwnerAction = block.timestamp;
+        _ownerActed();
         for (uint256 i; i < 3; i++) {
             address guardian = guardians_[i];
-            require(guardian != address(0) && !isGuardian[guardian] && guardian != agent_, "invalid guardian");
+            require(
+                guardian != address(0) && !isGuardian[guardian] && guardian != agent_ && guardian != owner_
+                    && guardian != backup_,
+                "invalid guardian"
+            );
             isGuardian[guardian] = true;
         }
     }
@@ -68,19 +78,57 @@ contract OperatingWallet is ReentrancyGuard {
     function setRecipient(address recipient, bool allowed) external onlyOwner {
         require(recipient != address(0) && recipient != address(this), "invalid recipient");
         approvedRecipients[recipient] = allowed;
-        lastOwnerAction = block.timestamp;
+        _ownerActed();
         emit RecipientPolicy(recipient, allowed);
     }
 
     function setAgentEnabled(bool enabled) external onlyOwner {
         agentEnabled = enabled;
-        lastOwnerAction = block.timestamp;
+        _ownerActed();
+    }
+
+    /// @notice Rotate a compromised or retired agent key. Limits stay immutable.
+    function setAgent(address newAgent) external onlyOwner {
+        require(
+            newAgent != address(0) && newAgent != owner && newAgent != backup && !isGuardian[newAgent]
+                && newAgent != address(this),
+            "invalid agent"
+        );
+        emit RoleUpdated("agent", agent, newAgent);
+        agent = newAgent;
+        _ownerActed();
+    }
+
+    function setBackup(address newBackup) external onlyOwner {
+        require(
+            newBackup != address(0) && newBackup != owner && newBackup != agent && !isGuardian[newBackup]
+                && newBackup != address(this),
+            "invalid backup"
+        );
+        emit RoleUpdated("backup", backup, newBackup);
+        backup = newBackup;
+        _ownerActed();
+    }
+
+    /// @notice Guardians can change only while no recovery is running.
+    function replaceGuardian(address previous, address next) external onlyOwner {
+        require(recoveryCandidate == address(0), "recovery active");
+        require(isGuardian[previous], "not a guardian");
+        require(
+            next != address(0) && !isGuardian[next] && next != agent && next != owner && next != backup
+                && next != address(this),
+            "invalid guardian"
+        );
+        isGuardian[previous] = false;
+        isGuardian[next] = true;
+        emit RoleUpdated("guardian", previous, next);
+        _ownerActed();
     }
 
     /// @notice A primary-owner signature on a real decision refreshes availability.
     ///         Agents, guardians, and the backup cannot call this function.
     function recordDecision(bytes32 decisionId, bool approved) external onlyOwner {
-        lastOwnerAction = block.timestamp;
+        _ownerActed();
         emit OwnerAction(msg.sender, decisionId, approved);
     }
 
@@ -96,9 +144,16 @@ contract OperatingWallet is ReentrancyGuard {
     }
 
     function executeSupervisor(bytes32 actionId, address recipient, uint256 amount) external nonReentrant {
-        require(msg.sender == owner || (msg.sender == backup && backupActive()), "supervisor unavailable");
+        bool primary = msg.sender == owner;
+        require(primary || (msg.sender == backup && backupActive()), "supervisor unavailable");
         require(amount > 0 && amount <= SUPERVISOR_TX_LIMIT, "supervisor transaction limit");
-        if (msg.sender == owner) lastOwnerAction = block.timestamp;
+        if (primary) {
+            _ownerActed();
+        } else {
+            // A stand-in approver keeps operations moving but cannot drain the wallet.
+            require(backupSpentThisAbsence + amount <= BACKUP_ABSENCE_LIMIT, "backup absence limit");
+            backupSpentThisAbsence += amount;
+        }
         _pay(actionId, recipient, amount, false);
     }
 
@@ -113,7 +168,12 @@ contract OperatingWallet is ReentrancyGuard {
     function initiateRecovery(address candidate) external onlyGuardian {
         require(block.timestamp >= lastOwnerAction + RECOVERY_SILENCE, "owner recently active");
         require(recoveryCandidate == address(0), "recovery already active");
-        require(candidate != address(0) && candidate != owner && candidate != agent && candidate != address(this), "invalid candidate");
+        // Guardians and the backup cannot nominate themselves or each other into authority.
+        require(
+            candidate != address(0) && candidate != owner && candidate != agent && candidate != backup
+                && !isGuardian[candidate] && candidate != address(this),
+            "invalid candidate"
+        );
         recoveryNonce++;
         recoveryCandidate = candidate;
         recoveryVotes = 0;
@@ -134,7 +194,7 @@ contract OperatingWallet is ReentrancyGuard {
         require(recoveryCandidate != address(0), "no active recovery");
         emit RecoveryCancelled(recoveryNonce);
         _clearRecovery();
-        lastOwnerAction = block.timestamp;
+        _ownerActed();
     }
 
     function finalizeRecovery() external {
@@ -143,8 +203,13 @@ contract OperatingWallet is ReentrancyGuard {
         address previous = owner;
         owner = recoveryCandidate;
         _clearRecovery();
-        lastOwnerAction = block.timestamp;
+        _ownerActed();
         emit AuthorityTransferred(previous, owner);
+    }
+
+    function _ownerActed() internal {
+        lastOwnerAction = block.timestamp;
+        backupSpentThisAbsence = 0;
     }
 
     function _clearRecovery() internal {

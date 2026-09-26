@@ -29,3 +29,14 @@ These decisions turn the single solar scenario into an industry-neutral platform
 - A simulated sensor feed stands in for telemetry during local testing and is off by default.
 - Evidence media moves out of the polled state document into its own table.
 
+## Closing the problem-statement gaps
+
+- **Approval fatigue is measured, not asserted.** The overview contrasts actions handled automatically with actions that needed a person, and a time-lapse runs 1–30 days of normal operations through the same gate so the ratio can be demonstrated.
+- **A local model, no key required.** An isolation forest trained on the workspace's own purchase history, plus per-item baselines, can escalate unusual purchases inside every limit. Like the optional AI reviewer, it only adds friction; it never approves.
+- **Reflexive approval earns a speed bump.** Three approvals within 30 seconds require a readback on the next one; a missed practice item requires readback until two are caught. Practice items are written by the real planner so their wording and quantities do not give them away.
+- **The backup is capped per absence, not per day.** A stand-in may approve at most $5,000 in total while the owner is away, in the workspace and in the contract. A daily cap would still let a compromised backup key drain the wallet over a long absence.
+- **Roles can be rotated, and nobody can nominate themselves.** The owner can replace the agent key, the backup, and guardians (never mid-recovery). Guardians and the backup cannot be recovery candidates or guardians of each other.
+- **Recovery is repeatable.** Authority passes to the other designated supervisor, so a completed recovery does not end the lifecycle.
+- **The chain is optional and local.** `npm run dev:chain` runs the same rules on a Hardhat devnet with real transactions and revert reasons. Its unlocked development accounts and in-transaction RPC calls are demo shortcuts; production needs real key management and an outbox.
+- **Emergencies are logged, not only tasks.** Workers can report an incident without an assigned task; it is saved on the phone first and pinned for supervisors until acknowledged. It never replaces calling emergency services.
+- **Legibility over density.** No interface text below 11 px (only the decorative equipment drawing keeps smaller labels); muted text meets 4.5:1 contrast against its actual background; hold-to-confirm works with gloves and long presses, gives haptic feedback, and the worker's screen stays awake during a task.

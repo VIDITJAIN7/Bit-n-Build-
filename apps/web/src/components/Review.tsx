@@ -3,14 +3,105 @@ import {
   ArrowRight,
   Check,
   ClipboardCheck,
+  Gauge,
   Info,
   ShieldCheck,
+  Siren,
   UserRound,
   X,
 } from "lucide-react";
 import { mediaUrl, money } from "../api";
-import type { State, Command, Page } from "../types";
+import type { Action, State, Command, Page } from "../types";
 import { HoldButton } from "./HoldButton";
+
+const ROLE_NAMES: Record<string, string> = {
+  supervisor: "Primary supervisor",
+  "replacement-supervisor": "Replacement supervisor",
+  backup: "Backup approver",
+};
+
+/** Announced attention checks: practice items, per-reviewer outcomes, and readback friction. */
+function AttentionChecks({
+  state,
+  command,
+  busy,
+}: {
+  state: State;
+  command: Command;
+  busy: boolean;
+}) {
+  const { drills, supervision } = state;
+  const reviewers = Object.entries(drills.stats);
+  return (
+    <section className="drill-banner attention-checks">
+      <Siren size={22} />
+      <div>
+        <strong>Attention checks {drills.enabled ? "on" : "off"}</strong>
+        <p>
+          When on, about {Math.round(drills.rate * 100)}% of new proposals are
+          announced practice items that imitate a routine restock but pay a
+          lookalike destination. They can never execute. Approving one turns on
+          readback for that reviewer until two are caught in a row. Separately,{" "}
+          {supervision.pace.limit} approvals within{" "}
+          {supervision.pace.window_seconds} seconds ask for a readback before the
+          next one.
+        </p>
+        {reviewers.length > 0 && (
+          <div className="drill-stats">
+            {reviewers.map(([role, stats]) => (
+              <span key={role}>
+                <strong>{ROLE_NAMES[role] ?? role}</strong> · caught{" "}
+                {stats.caught} · missed {stats.missed}
+                {stats.enhanced ? " · readback on" : ""}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+      <label className="toggle">
+        <input
+          type="checkbox"
+          role="switch"
+          checked={drills.enabled}
+          disabled={busy}
+          onChange={(e) =>
+            command("/drills", {
+              operation: e.target.checked ? "enable" : "disable",
+            })
+          }
+        />
+        <span>Attention checks</span>
+      </label>
+    </section>
+  );
+}
+
+/** What the anomaly model and the optional AI reviewer said, in one line each. */
+function RiskContext({ action }: { action: Action }) {
+  const { ml, ai_risk: ai } = action;
+  if (!ml && !ai) return null;
+  return (
+    <div className="risk-context">
+      {ml && !ml.learning && (
+        <span>
+          <Gauge size={14} />
+          {ml.model}: score {ml.score?.toFixed(2)} · threshold{" "}
+          {ml.threshold?.toFixed(2)} · {ml.trained_on} past purchases
+          {ml.flagged ? ` · ${ml.signals.join("; ")}` : " · looks routine"}
+        </span>
+      )}
+      {ai && (
+        <span>
+          <Gauge size={14} />
+          AI reviewer:{" "}
+          {ai.available
+            ? `${ai.score}/100${ai.flags.length ? ` · ${ai.flags.join("; ")}` : ""}`
+            : "unavailable, so a person decides"}
+        </span>
+      )}
+    </div>
+  );
+}
 
 export function Review({
   state,
@@ -28,7 +119,9 @@ export function Review({
   const [role, setRole] = useState("owner");
   const [filter, setFilter] = useState("all");
   const [acknowledged, setAcknowledged] = useState<Record<string, boolean>>({});
+  const [readbacks, setReadbacks] = useState<Record<string, string>>({});
   const actor = role === "owner" ? state.wallet.owner : "backup";
+  const readbackReason = state.supervision.readback?.[actor];
   const siteName = (id: string) =>
     state.sites.find((site) => site.id === id)?.name ?? "Unknown site";
   const pending = state.actions.filter(
@@ -71,8 +164,30 @@ export function Review({
               Escalation window missed — backup approver available
             </strong>
             <p>
-              The backup approver can handle pending decisions now. Guardian recovery is a
-              separate, longer process.
+              The backup approver can handle pending decisions now, up to{" "}
+              {money(state.supervision.backup_remaining_cents)} more while the
+              primary supervisor is away. Guardian recovery is a separate,
+              longer process.
+            </p>
+          </div>
+        </div>
+      )}
+      <AttentionChecks state={state} command={command} busy={busy} />
+      {readbackReason && (
+        <div className="availability-banner readback-banner" role="status">
+          <Gauge size={20} />
+          <div>
+            <strong>
+              {readbackReason === "pace"
+                ? "Slow down: readback required"
+                : "Enhanced review: readback required"}
+            </strong>
+            <p>
+              {readbackReason === "pace"
+                ? `You approved ${state.supervision.pace.limit} items in under ${state.supervision.pace.window_seconds} seconds.`
+                : "A practice item with a lookalike destination was approved."}{" "}
+              Type the payment destination (or the equipment code) shown on a
+              card to approve it.
             </p>
           </div>
         </div>
@@ -158,10 +273,13 @@ export function Review({
                   <div className="agent-explanation">
                     <span className="eyebrow small">PLANNER CONTEXT</span>
                     <p>{action.explanation}</p>
-                    <div>
-                      <span>Payment destination</span>
-                      <code>{action.recipient}</code>
-                    </div>
+                    {action.recipient && (
+                      <div>
+                        <span>Payment destination</span>
+                        <code>{action.recipient}</code>
+                      </div>
+                    )}
+                    <RiskContext action={action} />
                   </div>
                 </div>
                 {action.requires_field_check && (
@@ -271,6 +389,22 @@ export function Review({
                     </span>
                   ))}
                 </div>
+                {readbackReason && !alreadySigned && (
+                  <label className="readback-label">
+                    Type the{" "}
+                    {action.recipient ? "payment destination" : "equipment code"}{" "}
+                    to approve
+                    <input
+                      value={readbacks[action.id] ?? ""}
+                      onChange={(e) =>
+                        setReadbacks({ ...readbacks, [action.id]: e.target.value })
+                      }
+                      autoComplete="off"
+                      spellCheck={false}
+                      aria-label="Readback"
+                    />
+                  </label>
+                )}
                 <div className="review-footer">
                   <label className="acknowledge">
                     <input
@@ -308,12 +442,14 @@ export function Review({
                         !!needsEvidence ||
                         alreadySigned ||
                         wrongFirst ||
-                        !acknowledged[action.id]
+                        !acknowledged[action.id] ||
+                        (!!readbackReason && !readbacks[action.id]?.trim())
                       }
                       onConfirm={() =>
                         void command(`/actions/${action.id}/decision`, {
                           actor,
                           decision: "approve",
+                          readback: readbacks[action.id] ?? "",
                         })
                       }
                     >
@@ -334,8 +470,8 @@ export function Review({
       </div>
       <p className="footnote">
         <ShieldCheck size={14} />
-        Risk scores explain the routing. Server-side policy, evidence, and
-        workspace policy, evidence, and access rules determine whether an action can proceed.
+        Risk scores explain the routing. Workspace policy, field evidence, and
+        access rules decide whether an action can proceed.
       </p>
     </>
   );

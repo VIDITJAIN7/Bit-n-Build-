@@ -1,6 +1,7 @@
-"""Rules grant authority; the risk score is an explanation aid, not permission."""
+"""Rules grant authority; the risk score, the AI reviewer and the anomaly model are
+explanation and friction, never permission."""
 
-from .seed import now_iso
+from .seed import sim_now
 
 KINDS = ("purchase", "work_order", "field_check", "notify")
 
@@ -10,13 +11,20 @@ def money(cents):
 
 
 def refresh_daily_budget(state):
-    day = now_iso()[:10]
+    # Budgets follow the simulation clock, so a fast-forwarded week has seven budget days.
+    day = sim_now(state).date().isoformat()
     if state["wallet"]["agent_spend_day"] != day:
         state["wallet"]["agent_spend_day"] = day
         state["wallet"]["agent_spent_cents"] = 0
 
 
-def evaluate(state, action):
+def backup_remaining(state):
+    """What a stand-in backup approver may still spend during this absence of the owner."""
+    limit = state["policy"].get("backup_absence_cents", state["policy"]["supervisor_limit_cents"])
+    return max(0, limit - state["supervision"].get("backup_spent_cents", 0))
+
+
+def evaluate(state, action, actor=None):
     policy = state["policy"]
     amount = action["amount_cents"]
     reasons = []
@@ -52,9 +60,20 @@ def evaluate(state, action):
             reasons.append(
                 f"Purchase is {amount / typical:.1f}× larger than typical site purchases"
             )
+        ml = action.get("ml") or {}
+        if ml.get("flagged"):
+            # The model can escalate a purchase that is inside every limit, never the reverse.
+            score = f" (anomaly score {ml['score']:.2f})" if ml.get("score") is not None else ""
+            reasons.append(f"Unusual for this workspace{score}: {ml['signals'][0]}")
         if amount > policy["supervisor_limit_cents"]:
             limit = money(policy["supervisor_limit_cents"])
             hard_blocks.append(f"Above the operating wallet's {limit} transaction limit")
+        if actor == "backup" and amount > backup_remaining(state):
+            limit = money(policy.get("backup_absence_cents", policy["supervisor_limit_cents"]))
+            hard_blocks.append(
+                f"Above the backup approver's {limit} limit for this absence; "
+                "the owner or a recovered supervisor must approve"
+            )
         if amount > state["wallet"]["balance_cents"]:
             hard_blocks.append("Insufficient operating funds")
     if action.get("requires_field_check"):

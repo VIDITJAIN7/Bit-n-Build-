@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { Download, Search, CheckCircle2 } from "lucide-react";
+import { Download, Search, CheckCircle2, Receipt } from "lucide-react";
 import type { State } from "../types";
-import { time } from "../api";
+import { money, time } from "../api";
 
 export function Audit({ state }: { state: State }) {
   const [query, setQuery] = useState("");
@@ -19,9 +19,10 @@ export function Audit({ state }: { state: State }) {
           JSON.stringify(
             {
               exported_at: new Date().toISOString(),
-              mode: "local",
+              mode: state.wallet.mode,
               events: state.audit,
               receipts: state.wallet.receipts,
+              chain_transactions: state.chain.transactions ?? [],
             },
             null,
             2,
@@ -51,6 +52,50 @@ export function Audit({ state }: { state: State }) {
           Export JSON
         </button>
       </div>
+      {state.wallet.receipts.length > 0 && (
+        <section className="panel payments-panel">
+          <div className="panel-heading">
+            <h2>
+              Payments <span className="count">{state.wallet.receipts.length}</span>
+            </h2>
+          </div>
+          <div className="audit-list">
+            {[...state.wallet.receipts]
+              .reverse()
+              .slice(0, 8)
+              .map((receipt) => (
+                <article className="audit-row" key={receipt.id}>
+                  <span className="audit-symbol">
+                    <Receipt size={17} />
+                  </span>
+                  <div>
+                    <span className="event-name">
+                      {receipt.tx ? `local chain · block ${receipt.block}` : receipt.mode}
+                    </span>
+                    <h3>
+                      {money(receipt.amount_cents)} to {receipt.recipient}
+                    </h3>
+                    <p>
+                      {receipt.signer ? `${receipt.signer.replaceAll("-", " ")} · ` : ""}
+                      {receipt.action_id}
+                      {receipt.tx && (
+                        <>
+                          {" · "}
+                          <code title={receipt.tx}>
+                            {receipt.tx.slice(0, 12)}…{receipt.tx.slice(-6)}
+                          </code>
+                        </>
+                      )}
+                    </p>
+                  </div>
+                  <time title={new Date(receipt.at).toLocaleString()}>
+                    {time(receipt.at)}
+                  </time>
+                </article>
+              ))}
+          </div>
+        </section>
+      )}
       <section className="panel">
         <div className="panel-heading">
           <h2>

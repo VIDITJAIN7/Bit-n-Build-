@@ -13,6 +13,25 @@ export type Receipt = {
   at: string;
   recipient: string;
   action_id: string;
+  // Present when the payment ran on the local EVM devnet.
+  tx?: string;
+  block?: number;
+  signer?: string;
+};
+export type ModelAssessment = {
+  model: string;
+  learning?: boolean;
+  flagged: boolean;
+  score?: number;
+  threshold?: number;
+  trained_on?: number;
+  signals: string[];
+};
+export type AiRisk = {
+  score: number;
+  flags: string[];
+  explanation?: string;
+  available: boolean;
 };
 export type Source = "assets" | "inventory";
 export type Subject = {
@@ -41,6 +60,8 @@ export type Action = {
   drill_result?: "caught" | "missed";
   canary_expected?: string;
   policy: PolicyResult;
+  ml?: ModelAssessment;
+  ai_risk?: AiRisk;
   approvals: string[];
   requires_field_check: boolean;
   field_question?: string;
@@ -116,6 +137,60 @@ export type LocalReport = FieldReport & {
   subject_label?: string;
   question?: string;
   field_labels?: Record<string, string>;
+};
+export type IncidentKind =
+  | "injury"
+  | "heat"
+  | "fire"
+  | "electrical"
+  | "spill"
+  | "security"
+  | "other";
+export type Severity = "critical" | "serious" | "minor";
+export type IncidentReport = {
+  id: string;
+  site_id: string;
+  kind: IncidentKind;
+  severity: Severity;
+  note: string;
+  created_at: string;
+  location: { lat: number; lon: number; accuracy_m: number } | null;
+  attachments: Attachment[];
+};
+export type ServerIncident = Omit<IncidentReport, "attachments"> & {
+  attachments: StoredAttachment[];
+  status: "open" | "acknowledged";
+  received_at: string;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+};
+export type LocalIncident = IncidentReport & {
+  sync: "pending" | "confirmed" | "error";
+  error?: string;
+};
+export type ChainTransaction = {
+  hash: string;
+  block: number;
+  gas_used: number;
+  from_role: string;
+  summary: string;
+  at: string;
+};
+export type ChainStatus = {
+  mode: string;
+  connected: boolean;
+  network?: string;
+  rpc?: string;
+  chain_id?: number | null;
+  wallet?: string | null;
+  token?: string | null;
+  block?: number;
+  owner_role?: string | null;
+  backup_active?: boolean;
+  backup_spent_cents?: number;
+  recovery_votes?: number;
+  transactions?: ChainTransaction[];
+  error?: string;
 };
 export type AuditEvent = {
   id: string;
@@ -232,6 +307,7 @@ export type State = {
   actions: Action[];
   field_tasks: FieldTask[];
   reports: ServerReport[];
+  incidents: ServerIncident[];
   audit: AuditEvent[];
   stats: {
     auto_handled: number;
@@ -240,11 +316,23 @@ export type State = {
     blocked: number;
     alerts: number;
     field_dispatched: number;
+    ml_flagged: number;
+    incidents: number;
   };
+  ml: {
+    model: string;
+    features: string[];
+    trained_on: number;
+    threshold: number | null;
+    learning: boolean;
+  };
+  history_size: number;
+  chain: ChainStatus;
   agent: {
     enabled: boolean;
     live_feed: boolean;
     cycles: number;
+    simulated_hours: number;
     last_cycle_at: string | null;
     last_cycle_changes: number;
     interval_seconds: number;
@@ -261,6 +349,7 @@ export type State = {
     agent_per_action_cents: number;
     agent_daily_cents: number;
     supervisor_limit_cents: number;
+    backup_absence_cents: number;
     known_recipients: string[];
     typical_purchase_cents: number;
   };
@@ -269,6 +358,10 @@ export type State = {
     recovery_eligible: boolean;
     silence_hours: number;
     last_owner_action: string;
+    backup_remaining_cents: number;
+    // Approvers who must type a readback on their next approval, and why.
+    readback: Record<string, "pace" | "enhanced">;
+    pace: { limit: number; window_seconds: number };
   };
   drills: {
     enabled: boolean;
