@@ -85,7 +85,7 @@ export default function App() {
   const [accountEmail, setAccountEmail] = useState(
     () => remoteAuthEnabled ? "" : localStorage.getItem(EMAIL_KEY) ?? "",
   );
-  const [loginEmail, setLoginEmail] = useState("");
+  const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [loginError, setLoginError] = useState("");
   const [page, setPage] = useState<Page>(() =>
@@ -310,7 +310,7 @@ export default function App() {
     try {
       if (authClient) {
         const { error: authError } = await authClient.auth.signInWithPassword({
-          email: loginEmail.trim(),
+          email: loginUsername.trim(),
           password: loginPassword,
         });
         if (authError) throw authError;
@@ -328,15 +328,16 @@ export default function App() {
         return;
       }
       const account = await request<{
-        email: string;
+        username: string;
+        display_name: string;
         role: "admin" | "worker";
-      }>("/auth/login", { email: loginEmail, password: loginPassword });
+      }>("/auth/login", { username: loginUsername, password: loginPassword });
       const next = account.role;
       localStorage.setItem(ROLE_KEY, next);
-      localStorage.setItem(EMAIL_KEY, account.email);
+      localStorage.setItem(EMAIL_KEY, account.display_name || account.username);
       setRole(next);
       setSession(true);
-      setAccountEmail(account.email);
+      setAccountEmail(account.display_name || account.username);
       setPage(next === "worker" ? "field" : "control");
       window.history.replaceState(
         {},
@@ -356,7 +357,7 @@ export default function App() {
     localStorage.removeItem(EMAIL_KEY);
     sessionStorage.removeItem(ROLE_KEY);
     sessionStorage.removeItem(EMAIL_KEY);
-    setLoginEmail("");
+    setLoginUsername("");
     setLoginPassword("");
     setLoginError("");
     setSession(false);
@@ -389,13 +390,13 @@ export default function App() {
         >
           <h1>Sign in</h1>
           <label>
-            Work email
+            {remoteAuthEnabled ? "Work email" : "Username"}
             <input
-              type="email"
+              type={remoteAuthEnabled ? "email" : "text"}
               autoComplete="username"
-              value={loginEmail}
-              onChange={(event) => setLoginEmail(event.target.value)}
-              placeholder="you@company.com"
+              value={loginUsername}
+              onChange={(event) => setLoginUsername(event.target.value)}
+              placeholder={remoteAuthEnabled ? "you@company.com" : ""}
               required
             />
           </label>
@@ -437,28 +438,20 @@ export default function App() {
         >
           <span>Workkite</span>
         </button>
-        <label className="workspace-card site-switcher">
+        <div className="workspace-card site-switcher">
           <span className="workspace-icon">
             <SiteIcon size={18} />
           </span>
           <span className="site-switcher-text">
             <small>{site ? site.industry : "Site"}</small>
-            <select
+            <SitePicker
+              sites={state?.sites ?? []}
               value={siteFilter}
-              onChange={(e) => setSiteFilter(e.target.value)}
-              aria-label="Choose a site"
-            >
-              <option value="all">
-                All sites{state ? ` (${state.sites.length})` : ""}
-              </option>
-              {state?.sites.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
-            </select>
+              onChange={setSiteFilter}
+              variant="sidebar"
+            />
           </span>
-        </label>
+        </div>
         <nav aria-label="Main navigation">
           {pages.map(({ id, label, icon: Icon }) => (
             <button

@@ -5,6 +5,7 @@ import time
 from copy import deepcopy
 
 import pytest
+from averlock import adapters
 from averlock.adapters import AICommander, AIReviewPlanner, LocalPlanner, SimulatedFeed, SimulatedWallet
 from averlock.main import create_app
 from averlock.policy import evaluate
@@ -23,13 +24,153 @@ def client(tmp_path):
     return TestClient(create_app(tmp_path / "test.db", agent_interval=0))
 
 
+def test_chat_completion_retries_one_transient_provider_error(monkeypatch):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        request = adapters.httpx.Request("POST", url)
+        if len(calls) == 1:
+            return adapters.httpx.Response(503, request=request, json={"error": "busy"})
+        return adapters.httpx.Response(
+            200,
+            request=request,
+            json={"choices": [{"message": {"content": '{"ok":true}'}}]},
+        )
+
+    monkeypatch.setattr(adapters.httpx, "post", post)
+    monkeypatch.setattr(adapters.time, "sleep", lambda _seconds: None)
+
+    result = adapters._chat_completion(
+        "https://provider.example/v1/", "test-key", {"model": "test"}, 3
+    )
+
+    assert len(calls) == 2
+    assert calls[0][0] == "https://provider.example/v1/chat/completions"
+    assert result == '{"ok":true}'
+
+
+def test_chat_completion_retries_truncated_structured_output(monkeypatch):
+    requests = []
+
+    def post(url, **kwargs):
+        requests.append(json.loads(json.dumps(kwargs["json"])))
+        request = adapters.httpx.Request("POST", url)
+        content = '{"risk_score":' if len(requests) == 1 else (
+            '{"risk_score":12,"risk_flags":[],"explanation":"Routine maintenance."}'
+        )
+        finish_reason = "length" if len(requests) == 1 else "stop"
+        return adapters.httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": finish_reason,
+                        "message": {"content": content},
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(adapters.httpx, "post", post)
+
+    result = adapters._chat_completion(
+        "https://provider.example/v1", "test-key", {"model": "test", "max_tokens": 512}, 3
+    )
+
+    assert result == '{"risk_score":12,"risk_flags":[],"explanation":"Routine maintenance."}'
+    assert len(requests) == 2
+    assert requests[0]["max_tokens"] == 512
+    assert requests[1]["max_tokens"] >= 1024
+
+
+def test_chat_completion_does_not_block_workspace_for_gemini_quota_reset(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        request = adapters.httpx.Request("POST", url)
+        if len(calls) == 1:
+            return adapters.httpx.Response(
+                429,
+                request=request,
+                json=[
+                    {
+                        "error": {
+                            "message": "Please retry in 43.9s.",
+                            "details": [
+                                {
+                                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                                    "retryDelay": "43.9s",
+                                }
+                            ],
+                        }
+                    }
+                ],
+            )
+        return adapters.httpx.Response(
+            200,
+            request=request,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": '{"ok":true}'}}]},
+        )
+
+    monkeypatch.setattr(adapters.httpx, "post", post)
+    monkeypatch.setattr(adapters.time, "sleep", sleeps.append)
+
+    with pytest.raises(adapters.httpx.HTTPStatusError) as error:
+        adapters._chat_completion(
+            "https://provider.example/v1", "test-key", {"model": "test"}, 3
+        )
+
+    assert error.value.response.status_code == 429
+    assert len(calls) == 1
+    assert sleeps == []
+    assert adapters._retry_delay(error.value.response, 0.75) == 43.9
+
+
+def test_gemini_risk_reviewer_uses_configured_reasoning_and_json_budget(monkeypatch):
+    captured = {}
+
+    def post(url, **kwargs):
+        captured.update(kwargs["json"])
+        request = adapters.httpx.Request("POST", url)
+        return adapters.httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": '{"risk_score":12,"risk_flags":[],"explanation":"Routine maintenance."}'
+                        },
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(adapters.httpx, "post", post)
+    reviewer = adapters.OpenAICompatibleRiskReviewer(
+        "https://provider.example/v1", "test-key", "gemini-flash-latest", reasoning_effort="none"
+    )
+
+    result = reviewer.review({"action": "inspect"})
+
+    assert result["available"] is True and result["score"] == 12
+    assert captured["reasoning_effort"] == "none"
+    assert captured["max_tokens"] == 2048
+
+
 def test_local_sign_in_uses_server_configuration(monkeypatch, tmp_path):
     monkeypatch.setenv(
         "WORKKITE_LOCAL_USERS_JSON",
         json.dumps(
             [
                 {
-                    "email": "admin@company.local",
+                    "username": "admin",
+                    "display_name": "Workspace Admin",
                     "password": "secret-value",
                     "role": "admin",
                 }
@@ -39,15 +180,42 @@ def test_local_sign_in_uses_server_configuration(monkeypatch, tmp_path):
     with TestClient(create_app(tmp_path / "auth.db", agent_interval=0)) as auth:
         response = auth.post(
             "/api/auth/login",
-            json={"email": "ADMIN@COMPANY.LOCAL", "password": "secret-value"},
+            json={"username": "ADMIN", "password": "secret-value"},
         )
         assert response.status_code == 200
-        assert response.json() == {"email": "admin@company.local", "role": "admin"}
+        assert response.json() == {
+            "username": "admin",
+            "display_name": "Workspace Admin",
+            "role": "admin",
+            "workspace": "Workkite workspace",
+        }
         denied = auth.post(
             "/api/auth/login",
-            json={"email": "admin@company.local", "password": "wrong"},
+            json={"username": "admin", "password": "wrong"},
         )
         assert denied.status_code == 401
+
+
+def test_local_empty_workspace_starts_with_company_but_no_sample_operations(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("WORKKITE_LOCAL_EMPTY_WORKSPACE", "true")
+    monkeypatch.setenv("WORKKITE_LOCAL_WORKSPACE_NAME", "Test Company")
+    with TestClient(create_app(tmp_path / "empty-workspace.db", agent_interval=0)) as empty:
+        state = empty.get("/api/state").json()
+    assert state["workspace"]["name"] == "Test Company"
+    for section in (
+        "sites",
+        "assets",
+        "inventory",
+        "suppliers",
+        "triggers",
+        "actions",
+        "field_tasks",
+        "reports",
+        "audit",
+    ):
+        assert state[section] == []
 
 
 def test_production_api_requires_verified_membership_and_restricts_workers(monkeypatch):

@@ -26,10 +26,10 @@ def bind_workspace(workspace_id: str):
         _workspace_id.reset(token)
 
 
-def blank_workspace_state() -> dict:
+def blank_workspace_state(workspace_name: str = "Workkite workspace") -> dict:
     """Create a usable empty workspace without local/sample operational data."""
     state = initial_state()
-    state["workspace"] = {"name": "Workkite workspace"}
+    state["workspace"] = {"name": workspace_name}
     for section in (
         "sites",
         "assets",

@@ -19,8 +19,9 @@ class Repository(Protocol):
 
 
 class SQLiteRepository:
-    def __init__(self, path: str):
+    def __init__(self, path: str, seed_factory=initial_state):
         self.path = path
+        self.seed_factory = seed_factory
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with self.transaction() as db:
             db.execute(
@@ -34,7 +35,8 @@ class SQLiteRepository:
             row = db.execute("SELECT payload FROM state WHERE id=1").fetchone()
             if row is None:
                 db.execute(
-                    "INSERT OR REPLACE INTO state VALUES (1, ?)", (json.dumps(initial_state()),)
+                    "INSERT OR REPLACE INTO state VALUES (1, ?)",
+                    (json.dumps(self.seed_factory()),),
                 )
             else:
                 state = json.loads(row[0])
@@ -61,7 +63,7 @@ class SQLiteRepository:
                     "recovery",
                 }
                 if not required_sections.issubset(state):
-                    state = initial_state()
+                    state = self.seed_factory()
                     db.execute("UPDATE state SET payload=? WHERE id=1", (json.dumps(state),))
                 elif state.get("schema_version", 0) < SCHEMA_VERSION:
                     state = migrate_state(state)

@@ -7,10 +7,12 @@ export function SitePicker({
   sites,
   value,
   onChange,
+  variant = "field",
 }: {
   sites: Site[];
   value: string;
   onChange: (siteId: string) => void;
+  variant?: "field" | "sidebar";
 }) {
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
@@ -52,10 +54,10 @@ export function SitePicker({
   }
 
   return (
-    <div className="worker-site-picker" ref={root}>
+    <div className={`worker-site-picker${variant === "sidebar" ? " sidebar-site-picker" : ""}`} ref={root}>
       <button
         ref={trigger}
-        className="worker-site-trigger"
+        className={`worker-site-trigger${variant === "sidebar" ? " sidebar-site-trigger" : ""}`}
         type="button"
         aria-label="Choose work site"
         aria-haspopup="menu"
@@ -80,7 +82,7 @@ export function SitePicker({
       {open && (
         <div
           id="worker-site-menu"
-          className="worker-site-menu"
+          className={`worker-site-menu${variant === "sidebar" ? " sidebar-site-menu" : ""}`}
           role="menu"
           aria-label="Work site"
           onKeyDown={moveFocus}
@@ -91,7 +93,7 @@ export function SitePicker({
               ref={(element) => {
                 options.current[index] = element;
               }}
-              className="worker-site-option"
+              className={`worker-site-option${variant === "sidebar" ? " sidebar-site-option" : ""}`}
               type="button"
               role="menuitemradio"
               aria-checked={value === item.id}

@@ -19,8 +19,14 @@ from .adapters import (
     OpenAICompatibleCommander,
     OpenAICompatibleRiskReviewer,
 )
-from .production import PostgresRepository, bind_workspace, verify_supabase_request
+from .production import (
+    PostgresRepository,
+    bind_workspace,
+    blank_workspace_state,
+    verify_supabase_request,
+)
 from .repository import SQLiteRepository
+from .seed import initial_state
 from .service import DomainError, OperationsService
 
 logger = logging.getLogger("averlock.agent")
@@ -116,7 +122,7 @@ class Toggle(StrictModel):
 
 
 class LoginRequest(StrictModel):
-    email: str = Field(min_length=3, max_length=254)
+    username: str = Field(min_length=1, max_length=80)
     password: str = Field(min_length=1, max_length=256)
 
 
@@ -284,11 +290,16 @@ def create_app(database_path=None, agent_interval=None):
         base_url = setting("WORKKITE_LLM_BASE_URL", legacy_name="AVERLOCK_LLM_BASE_URL")
         api_key = setting("WORKKITE_LLM_API_KEY", legacy_name="AVERLOCK_LLM_API_KEY")
         model = setting("WORKKITE_LLM_MODEL", legacy_name="AVERLOCK_LLM_MODEL")
+        reasoning_effort = setting("WORKKITE_LLM_REASONING_EFFORT", "").strip() or None
         if agent_mode == "ai-risk":
             # Backward-compatible mode: AI risk scoring added to the rules planner.
-            planner = AIReviewPlanner(OpenAICompatibleRiskReviewer(base_url, api_key, model))
+            planner = AIReviewPlanner(
+                OpenAICompatibleRiskReviewer(base_url, api_key, model, reasoning_effort=reasoning_effort)
+            )
         else:
-            planner = AICommander(OpenAICompatibleCommander(base_url, api_key, model))
+            planner = AICommander(
+                OpenAICompatibleCommander(base_url, api_key, model, reasoning_effort=reasoning_effort)
+            )
     else:
         raise RuntimeError("WORKKITE_AGENT must be 'rules' or 'ai-commander'.")
 
@@ -297,9 +308,13 @@ def create_app(database_path=None, agent_interval=None):
         base_url = setting("WORKKITE_LLM_BASE_URL", legacy_name="AVERLOCK_LLM_BASE_URL")
         api_key = setting("WORKKITE_LLM_API_KEY", legacy_name="AVERLOCK_LLM_API_KEY")
         model = setting("WORKKITE_LLM_MODEL", legacy_name="AVERLOCK_LLM_MODEL")
+        reasoning_effort = setting("WORKKITE_LLM_REASONING_EFFORT", "").strip() or None
         if not (base_url and api_key and model):
             raise RuntimeError("AI risk review requires WORKKITE_LLM_BASE_URL, WORKKITE_LLM_MODEL, and WORKKITE_LLM_API_KEY.")
-        planner = AIReviewPlanner(OpenAICompatibleRiskReviewer(base_url, api_key, model), planner)
+        planner = AIReviewPlanner(
+            OpenAICompatibleRiskReviewer(base_url, api_key, model, reasoning_effort=reasoning_effort),
+            planner,
+        )
     elif risk_mode not in {"off", "", "ai"}:
         raise RuntimeError("WORKKITE_RISK_REVIEWER must be 'off' or 'ai'.")
     if setting("WORKKITE_WALLET", "local", "AVERLOCK_WALLET") not in {"local", "simulated"}:
@@ -322,7 +337,15 @@ def create_app(database_path=None, agent_interval=None):
             str(Path(__file__).parents[1] / "data" / "averlock.db"),
             "AVERLOCK_DATABASE",
         )
-        repository = SQLiteRepository(str(db))
+        seed_factory = initial_state
+        if setting("WORKKITE_LOCAL_EMPTY_WORKSPACE", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            workspace_name = setting("WORKKITE_LOCAL_WORKSPACE_NAME", "Workkite workspace")
+            seed_factory = lambda: blank_workspace_state(workspace_name)
+        repository = SQLiteRepository(str(db), seed_factory=seed_factory)
     service = OperationsService(repository, agent=planner)
     service.interval = interval
 
@@ -463,23 +486,28 @@ def create_app(database_path=None, agent_interval=None):
             raise HTTPException(status_code=503, detail="Sign-in is unavailable") from error
         if not isinstance(users, list):
             raise HTTPException(status_code=503, detail="Sign-in is unavailable")
-        email = body.email.strip().casefold()
+        username = body.username.strip().casefold()
         account = next(
             (
                 user
                 for user in users
                 if isinstance(user, dict)
-                and isinstance(user.get("email"), str)
+                and isinstance(user.get("username"), str)
                 and isinstance(user.get("password"), str)
                 and user.get("role") in {"admin", "worker"}
-                and secrets.compare_digest(user["email"].strip().casefold(), email)
+                and secrets.compare_digest(user["username"].strip().casefold(), username)
                 and secrets.compare_digest(user["password"], body.password)
             ),
             None,
         )
         if account is None:
-            raise HTTPException(status_code=401, detail="Email or password is incorrect")
-        return {"email": email, "role": account["role"]}
+            raise HTTPException(status_code=401, detail="Username or password is incorrect")
+        return {
+            "username": username,
+            "display_name": account.get("display_name", username),
+            "role": account["role"],
+            "workspace": account.get("workspace", "Workkite workspace"),
+        }
 
     @app.get("/api/auth/me")
     def current_user(request: Request):
