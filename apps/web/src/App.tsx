@@ -21,7 +21,9 @@ import {
   enqueue,
   listReports,
   syncReports,
+  clearLocalData,
 } from "./offline";
+import { authClient, remoteAuthEnabled } from "./auth";
 import { industryIcon } from "./rules";
 import type {
   FieldReport,
@@ -75,10 +77,10 @@ export default function App() {
     () => readSavedRole() ?? "admin",
   );
   const [session, setSession] = useState(
-    () => localStorage.getItem(ROLE_KEY) !== null,
+    () => !remoteAuthEnabled && localStorage.getItem(ROLE_KEY) !== null,
   );
   const [accountEmail, setAccountEmail] = useState(
-    () => localStorage.getItem(EMAIL_KEY) ?? "",
+    () => remoteAuthEnabled ? "" : localStorage.getItem(EMAIL_KEY) ?? "",
   );
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
@@ -104,6 +106,44 @@ export default function App() {
   const offline = !connected;
   const notify = useCallback((message: string) => setNotification(message), []);
   useEffect(() => {
+    if (!authClient) return;
+    let active = true;
+    void (async () => {
+      const { data, error: sessionError } = await authClient.auth.getSession();
+      if (!active) return;
+      if (sessionError || !data.session) {
+        setSession(false);
+        setLoading(false);
+        return;
+      }
+      try {
+        const account = await request<{ email: string; role: "admin" | "worker" }>("/auth/me");
+        if (!active) return;
+        setRole(account.role);
+        setAccountEmail(account.email);
+        setSession(true);
+      } catch (error) {
+        await authClient.auth.signOut();
+        if (!active) return;
+        setLoginError(error instanceof Error ? error.message : "Account access could not be verified.");
+        setSession(false);
+        setLoading(false);
+      }
+    })();
+    const { data: authState } = authClient.auth.onAuthStateChange((event) => {
+      if (event === "SIGNED_OUT") {
+        setSession(false);
+        setAccountEmail("");
+        setState(null);
+      }
+    });
+    return () => {
+      active = false;
+      authState.subscription.unsubscribe();
+    };
+  }, []);
+  useEffect(() => {
+    if (remoteAuthEnabled) return;
     const syncAcrossTabs = () => {
       const savedRole = localStorage.getItem(ROLE_KEY);
       const validRole = savedRole === "admin" || savedRole === "worker";
@@ -125,6 +165,7 @@ export default function App() {
     if (session) setPage(role === "worker" ? "field" : "control");
   }, [role, session]);
   const refresh = useCallback(async () => {
+    if (!session) return;
     if (refreshing.current) return;
     refreshing.current = true;
     const started = stamp.current;
@@ -146,8 +187,13 @@ export default function App() {
     } finally {
       refreshing.current = false;
     }
-  }, [notify]);
+  }, [notify, session]);
   useEffect(() => {
+    if (!session) {
+      setState(null);
+      setLoading(!remoteAuthEnabled);
+      return;
+    }
     let active = true;
     void (async () => {
       try {
@@ -172,7 +218,7 @@ export default function App() {
       window.removeEventListener("online", online);
       window.removeEventListener("offline", offlineEvent);
     };
-  }, [refresh, notify]);
+  }, [refresh, notify, session]);
   useEffect(() => {
     // The agent works in the background; the panel follows it without a button.
     if (offline || loading) return;
@@ -259,6 +305,25 @@ export default function App() {
   async function signIn() {
     setLoginError("");
     try {
+      if (authClient) {
+        const { error: authError } = await authClient.auth.signInWithPassword({
+          email: loginEmail.trim(),
+          password: loginPassword,
+        });
+        if (authError) throw authError;
+        const account = await request<{
+          email: string;
+          role: "admin" | "worker";
+        }>("/auth/me");
+        await clearLocalData().catch(() => undefined);
+        setRole(account.role);
+        setAccountEmail(account.email);
+        setSession(true);
+        setPage(account.role === "worker" ? "field" : "control");
+        window.history.replaceState({}, "", account.role === "worker" ? "/worker" : "/admin");
+        setLoginPassword("");
+        return;
+      }
       const account = await request<{
         email: string;
         role: "admin" | "worker";
@@ -281,7 +346,9 @@ export default function App() {
       );
     }
   }
-  function signOut() {
+  async function signOut() {
+    if (authClient) await authClient.auth.signOut();
+    await clearLocalData().catch(() => undefined);
     localStorage.removeItem(ROLE_KEY);
     localStorage.removeItem(EMAIL_KEY);
     sessionStorage.removeItem(ROLE_KEY);

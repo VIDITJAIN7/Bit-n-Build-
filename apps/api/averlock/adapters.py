@@ -1,7 +1,7 @@
 """External services go behind these interfaces. The default adapters need no keys."""
 
-import random
 import json
+import random
 import re
 from typing import Protocol
 from uuid import uuid4

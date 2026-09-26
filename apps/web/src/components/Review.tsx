@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ArrowRight,
   Check,
@@ -8,9 +8,32 @@ import {
   UserRound,
   X,
 } from "lucide-react";
-import { mediaUrl, money } from "../api";
+import { loadEvidence, money } from "../api";
 import type { State, Command, Page } from "../types";
 import { HoldButton } from "./HoldButton";
+
+function EvidenceMedia({ reportId, kind }: { reportId: string; kind: "photo" | "audio" }) {
+  const [source, setSource] = useState("");
+  useEffect(() => {
+    let active = true;
+    let objectUrl = "";
+    void loadEvidence(reportId, kind).then((url) => {
+      objectUrl = url;
+      if (active) setSource(url);
+      else URL.revokeObjectURL(url);
+    }).catch(() => setSource(""));
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [reportId, kind]);
+  if (!source) return <small>Evidence unavailable</small>;
+  return kind === "photo" ? (
+    <img src={source} alt="Technician equipment evidence" loading="lazy" />
+  ) : (
+    <audio src={source} controls preload="none" />
+  );
+}
 
 export function Review({
   state,
@@ -240,19 +263,7 @@ export function Review({
                             <small>
                               {attachment.name}
                             </small>
-                            {attachment.kind === "photo" ? (
-                              <img
-                                src={mediaUrl(report.id, "photo")}
-                                alt="Technician equipment evidence"
-                                loading="lazy"
-                              />
-                            ) : (
-                              <audio
-                                src={mediaUrl(report.id, "audio")}
-                                controls
-                                preload="none"
-                              />
-                            )}
+                            <EvidenceMedia reportId={report.id} kind={attachment.kind} />
                           </div>
                         ))}
                       </div>

@@ -1,5 +1,5 @@
-# Vercel + Supabase deployment workspace
+# Vercel + Supabase
 
-The deployment plan lives in [`../../docs/deployment-vercel-supabase.md`](../../docs/deployment-vercel-supabase.md). Keep deployment-specific notes, Vercel configuration, and environment templates here rather than mixing hosting assumptions into local app code.
+The production API entry point, Vercel routing, Supabase migrations, verified authentication, and Postgres adapter are in place. Read [`../../docs/deployment-vercel-supabase.md`](../../docs/deployment-vercel-supabase.md) for the remaining account setup before deployment.
 
-This folder is intentionally a setup scaffold. There is no production `vercel.json` yet because the app still needs a Postgres repository, verified authentication and server-side role checks, a production API entry point, and durable scheduled work. Copy `.env.production.example` into platform environment settings by hand; do not commit real values.
+Add values from `.env.production.example` to Vercel's Production environment. Do not commit real credentials. First invite the workspace owner from Supabase Auth; the database trigger assigns the initial invited account administrator access.

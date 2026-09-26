@@ -8,6 +8,7 @@ import pytest
 from averlock.adapters import AIReviewPlanner, SimulatedFeed, SimulatedWallet
 from averlock.main import create_app
 from averlock.policy import evaluate
+from averlock.production import blank_workspace_state
 from averlock.seed import initial_state, migrate_state
 from fastapi.testclient import TestClient
 
@@ -47,6 +48,75 @@ def test_local_sign_in_uses_server_configuration(monkeypatch, tmp_path):
             json={"email": "admin@company.local", "password": "wrong"},
         )
         assert denied.status_code == 401
+
+
+def test_production_api_requires_verified_membership_and_restricts_workers(monkeypatch):
+    from contextvars import ContextVar
+
+    from averlock import main
+
+    workspace = ContextVar("test_workspace", default=None)
+
+    class MemoryPostgresRepository:
+        def __init__(self, _connection_string):
+            self.state = blank_workspace_state()
+
+        def read(self):
+            assert workspace.get() == "workspace-1"
+            return self.state
+
+        def mutate(self, change, blobs=()):
+            result = change(self.state)
+            return self.state, result
+
+        def blob(self, _blob_id):
+            return None
+
+        def clear_blobs(self):
+            return None
+
+    async def verified_identity(request):
+        token = request.headers.get("authorization")
+        if token != "Bearer valid-worker-token":
+            return None
+        return {
+            "id": "user-1",
+            "email": "worker@example.com",
+            "workspace_id": "workspace-1",
+            "role": "worker",
+            "display_name": "Field Worker",
+        }
+
+    monkeypatch.setenv("WORKKITE_ENV", "production")
+    monkeypatch.setenv("SUPABASE_URL", "https://unit-test.supabase.co")
+    monkeypatch.setenv("SUPABASE_PUBLISHABLE_KEY", "public-test-key")
+    monkeypatch.setenv("SUPABASE_DATABASE_URL", "postgresql://not-used")
+    monkeypatch.setattr(main, "PostgresRepository", MemoryPostgresRepository)
+
+    def test_bind_workspace(workspace_id):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def bound():
+            key = workspace.set(workspace_id)
+            try:
+                yield
+            finally:
+                workspace.reset(key)
+
+        return bound()
+
+    monkeypatch.setattr(main, "verify_supabase_request", verified_identity)
+    monkeypatch.setattr(main, "bind_workspace", test_bind_workspace)
+    with TestClient(create_app(agent_interval=0)) as hosted:
+        assert hosted.get("/api/state").status_code == 401
+        response = hosted.get("/api/state", headers={"Authorization": "Bearer valid-worker-token"})
+        assert response.status_code == 200, response.text
+        assert response.json()["wallet"]["mode"] == "hidden"
+        denied = hosted.post(
+            "/api/triggers", headers={"Authorization": "Bearer valid-worker-token"}
+        )
+        assert denied.status_code == 403
 
 
 def post(client, path, body=None, status=200, method="post"):
@@ -142,9 +212,12 @@ def test_scheduled_agent_route_requires_configured_bearer_secret(monkeypatch, tm
     with TestClient(app) as scheduled_client:
         assert scheduled_client.get("/api/cron/agent").status_code == 503
         monkeypatch.setenv("CRON_SECRET", "private-test-scheduler-secret")
-        assert scheduled_client.get(
-            "/api/cron/agent", headers={"Authorization": "Bearer wrong"}
-        ).status_code == 401
+        assert (
+            scheduled_client.get(
+                "/api/cron/agent", headers={"Authorization": "Bearer wrong"}
+            ).status_code
+            == 401
+        )
         response = scheduled_client.get(
             "/api/cron/agent",
             headers={"Authorization": "Bearer private-test-scheduler-secret"},
@@ -249,9 +322,7 @@ def test_task_rule_edits_update_open_worker_assignments(client):
     )
     state = post(client, "/triggers", body)["state"]
     trigger = next(t for t in state["triggers"] if t["name"] == body["name"])
-    task = next(
-        t for t in cycle(client)["field_tasks"] if t["trigger_id"] == trigger["id"]
-    )
+    task = next(t for t in cycle(client)["field_tasks"] if t["trigger_id"] == trigger["id"])
     completed = {**task, "id": "task-completed-copy", "status": "answered"}
     client.app.state.service.repository.mutate(
         lambda current: current["field_tasks"].append(completed)
@@ -270,9 +341,7 @@ def test_task_rule_edits_update_open_worker_assignments(client):
     }
     updated = post(client, f"/triggers/{trigger['id']}", edited, method="put")["state"]
     active = next(t for t in updated["field_tasks"] if t["id"] == task["id"])
-    archived = next(
-        t for t in updated["field_tasks"] if t["id"] == "task-completed-copy"
-    )
+    archived = next(t for t in updated["field_tasks"] if t["id"] == "task-completed-copy")
     assert active["question"] == "Does BAT-01 show a charging fault?"
     assert active["assignee"] == "Priya Worker"
     assert active["report_fields"] == edited["action"]["report_fields"]

@@ -8,11 +8,12 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from .adapters import AIReviewPlanner, LocalPlanner, OpenAICompatibleRiskReviewer
+from .production import PostgresRepository, bind_workspace, verify_supabase_request
 from .repository import SQLiteRepository
 from .service import DomainError, OperationsService
 
@@ -220,6 +221,7 @@ def setting(name, default="", legacy_name=None):
 
 
 def create_app(database_path=None, agent_interval=None):
+    production = setting("WORKKITE_ENV", "local").strip().lower() == "production"
     agent_mode = setting("WORKKITE_AGENT", "rules", "AVERLOCK_AGENT").strip().lower()
     if agent_mode in {"rules", "local"}:
         planner = LocalPlanner()
@@ -247,14 +249,21 @@ def create_app(database_path=None, agent_interval=None):
         if agent_interval is None
         else agent_interval
     )
-    db = database_path or os.getenv(
-        setting(
+    if production:
+        required = ("SUPABASE_URL", "SUPABASE_PUBLISHABLE_KEY", "SUPABASE_DATABASE_URL")
+        missing = [name for name in required if not setting(name)]
+        if missing:
+            raise RuntimeError(f"Production API requires configuration: {', '.join(missing)}")
+        repository = PostgresRepository(setting("SUPABASE_DATABASE_URL"))
+        interval = 0
+    else:
+        db = database_path or setting(
             "WORKKITE_DATABASE",
             str(Path(__file__).parents[1] / "data" / "averlock.db"),
             "AVERLOCK_DATABASE",
         )
-    )
-    service = OperationsService(SQLiteRepository(str(db)), agent=planner)
+        repository = SQLiteRepository(str(db))
+    service = OperationsService(repository, agent=planner)
     service.interval = interval
 
     @asynccontextmanager
@@ -269,9 +278,13 @@ def create_app(database_path=None, agent_interval=None):
                     await task
 
     app = FastAPI(
-        title="Averlock local operations API",
+        title="Workkite operations API" if production else "Workkite local operations API",
         version="0.2.0",
-        description="Local operations API. Authentication and wallet adapters are not configured; bind to loopback only.",
+        description=(
+            "Authenticated, workspace-scoped operations API."
+            if production
+            else "Local operations API. Authentication and wallet adapters are not configured; bind to loopback only."
+        ),
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -286,11 +299,84 @@ def create_app(database_path=None, agent_interval=None):
         allow_headers=["Content-Type"],
     )
     app.state.service = service
+    app.state.production = production
 
-    def command(fn):
+    @app.middleware("http")
+    async def authenticate_workspace(request, call_next):
+        if not production or request.url.path == "/api/health":
+            return await call_next(request)
+        if request.url.path == "/api/cron/agent" and request.method == "GET":
+            # This route authenticates independently with CRON_SECRET.
+            return await call_next(request)
+        identity = await verify_supabase_request(request)
+        if identity is None:
+            return Response(
+                content=json.dumps({"detail": "Sign in to continue."}),
+                status_code=401,
+                media_type="application/json",
+            )
+        request.state.account = identity
+        path = request.url.path
+        method = request.method.upper()
+        is_worker_route = (
+            path == "/api/auth/me"
+            or (path == "/api/state" and method == "GET")
+            or (path == "/api/reports" and method == "POST")
+            or (path.startswith("/api/reports/") and "/media/" in path and method == "GET")
+        )
+        if identity["role"] == "worker" and not is_worker_route:
+            return Response(
+                content=json.dumps({"detail": "Administrator access is required."}),
+                status_code=403,
+                media_type="application/json",
+            )
+        # These endpoints only support local scenarios and must never appear in
+        # a hosted operations workspace.
+        if path.startswith(("/api/demo/", "/api/drills", "/api/weather/scenario", "/api/recovery")):
+            return Response(
+                content=json.dumps({"detail": "This operation is unavailable in production."}),
+                status_code=404,
+                media_type="application/json",
+            )
+        with bind_workspace(identity["workspace_id"]):
+            return await call_next(request)
+
+    def visible_snapshot(request: Request | None = None):
+        snapshot = service.snapshot()
+        if production and request is not None and request.state.account["role"] == "worker":
+            account = request.state.account
+            snapshot["field_tasks"] = [
+                task for task in snapshot["field_tasks"] if worker_can_access_task(task, account)
+            ]
+            allowed_task_ids = {task["id"] for task in snapshot["field_tasks"]}
+            snapshot["reports"] = [
+                report
+                for report in snapshot["reports"]
+                if report.get("task_id") in allowed_task_ids
+            ]
+            task_asset_ids = {task.get("subject_id") for task in snapshot["field_tasks"]}
+            snapshot["assets"] = [
+                asset for asset in snapshot["assets"] if asset["id"] in task_asset_ids
+            ]
+            snapshot["actions"] = []
+            snapshot["triggers"] = []
+            snapshot["inventory"] = []
+            snapshot["suppliers"] = []
+            snapshot["wallet"] = {"balance_cents": 0, "receipts": [], "mode": "hidden"}
+            snapshot["audit"] = []
+        return snapshot
+
+    def worker_can_access_task(task, account):
+        assignee = (task.get("assignee") or "").strip().casefold()
+        return not assignee or assignee in {
+            account["email"].strip().casefold(),
+            account["display_name"].strip().casefold(),
+        }
+
+    def command(fn, request: Request | None = None):
         try:
             _, message = fn()
-            return {"state": service.snapshot(), "message": message}
+            return {"state": visible_snapshot(request), "message": message}
         except (DomainError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -298,14 +384,16 @@ def create_app(database_path=None, agent_interval=None):
     def health():
         return {
             "status": "ok",
-            "mode": "local",
+            "mode": "production" if production else "local",
             "agent": service.agent.mode,
-            "wallet": "simulated",
+            "wallet": "unconfigured" if production else "simulated",
         }
 
     @app.post("/api/auth/login")
     def login(body: LoginRequest):
         """Local role routing from server-side configuration; not production auth."""
+        if production:
+            raise HTTPException(status_code=404, detail="Use Supabase sign-in")
         configured = os.getenv("WORKKITE_LOCAL_USERS_JSON", "[]")
         try:
             users = json.loads(configured)
@@ -332,9 +420,20 @@ def create_app(database_path=None, agent_interval=None):
             raise HTTPException(status_code=401, detail="Email or password is incorrect")
         return {"email": email, "role": account["role"]}
 
+    @app.get("/api/auth/me")
+    def current_user(request: Request):
+        if not production:
+            raise HTTPException(status_code=404, detail="Hosted identity is not configured")
+        account = request.state.account
+        return {
+            "email": account["email"],
+            "role": account["role"],
+            "workspace_id": account["workspace_id"],
+        }
+
     @app.get("/api/state")
-    def state():
-        return service.snapshot()
+    def state(request: Request):
+        return visible_snapshot(request)
 
     @app.post("/api/agent")
     def agent_settings(body: AgentSettings):
@@ -352,6 +451,13 @@ def create_app(database_path=None, agent_interval=None):
         supplied = authorization.removeprefix("Bearer ") if authorization else ""
         if not secrets.compare_digest(supplied, cron_secret):
             raise HTTPException(status_code=401, detail="Unauthorized scheduled request")
+        if production:
+            results = []
+            for workspace_id in repository.workspace_ids():
+                with bind_workspace(workspace_id):
+                    _, message = service.cycle()
+                    results.append({"workspace_id": workspace_id, "message": message})
+            return {"status": "ok", "workspaces_processed": len(results)}
         return command(service.cycle)
 
     @app.post("/api/triggers")
@@ -409,11 +515,42 @@ def create_app(database_path=None, agent_interval=None):
         return command(lambda: service.request_verification(action_id))
 
     @app.post("/api/reports")
-    def report(body: Report):
-        return command(lambda: service.submit_report(body.model_dump()))
+    def report(body: Report, request: Request):
+        if production:
+            state = service.snapshot()
+            task = next(
+                (
+                    item
+                    for item in state["field_tasks"]
+                    if item.get("id") == body.task_id and item.get("status") == "open"
+                ),
+                None,
+            )
+            if task is None:
+                raise HTTPException(status_code=404, detail="Open task not found")
+            if request.state.account["role"] == "worker" and not worker_can_access_task(
+                task, request.state.account
+            ):
+                raise HTTPException(status_code=404, detail="Open task not found")
+        return command(lambda: service.submit_report(body.model_dump()), request)
 
     @app.get("/api/reports/{report_id}/media/{kind}")
-    def media(report_id: str, kind: Literal["photo", "audio"]):
+    def media(report_id: str, kind: Literal["photo", "audio"], request: Request):
+        if production and request.state.account["role"] == "worker":
+            snapshot = service.snapshot()
+            report_record = next(
+                (item for item in snapshot["reports"] if item.get("id") == report_id), None
+            )
+            task = next(
+                (
+                    item
+                    for item in snapshot["field_tasks"]
+                    if item.get("id") == (report_record or {}).get("task_id")
+                ),
+                None,
+            )
+            if task is None or not worker_can_access_task(task, request.state.account):
+                raise HTTPException(status_code=404, detail="Evidence not found")
         data_url = service.media(report_id, kind)
         if not data_url:
             raise HTTPException(status_code=404, detail="No attachment of this kind")

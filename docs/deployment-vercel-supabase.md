@@ -1,58 +1,51 @@
-# Deployment path: Vercel + Supabase + Firebase Cloud Messaging
+# Deployment path: Vercel + Supabase
 
-This is the intended hosted stack for the current React/Vite product. Vercel can host the compiled frontend without a Next.js migration. The Python runtime can host FastAPI, but the current backend is intentionally local-only: it stores a single SQLite state record, starts a five-second background loop, and has no verified identity or role checks. Do not deploy that configuration as-is.
+Workkite uses a React/Vite frontend and FastAPI API. Local development uses SQLite; hosted mode uses Supabase Auth and Postgres with workspace-scoped access. The Vercel configuration serves the frontend and `/api/*` functions from one project. Keep production locked until all required Vercel environment variables are set and the first administrator has been invited.
 
 ## Target layout
 
 ```text
 Worker/Admin browser
-  ├─ Vercel: Vite static site, HTTPS, service worker
+  ├─ Vercel: Vite site and FastAPI functions
   ├─ Supabase Auth: verified sessions and user identity
-  ├─ Supabase Postgres: tenant-scoped records, triggers, actions, reports, audit, outbox
-  ├─ Supabase Storage: field photos/audio (private buckets, scoped policies)
-  └─ FCM: push notification delivery
+  ├─ Supabase Postgres: workspace-scoped operations, reports and audit
+  └─ Supabase Storage: private field-evidence bucket (direct upload follow-up)
 
 Vercel Functions / API
   ├─ validate Supabase JWT and workspace role on every protected request
-  ├─ apply database-backed deterministic policy and validated AI risk assessments
-  └─ process idempotent event/outbox work; never trust browser-supplied roles
+  ├─ apply deterministic policy under a transactionally locked workspace record
+  └─ never trust browser-supplied roles
 ```
 
 ## Setup sequence
 
-1. Create the Vercel project from this repository with the repository root as the project root. Use `npm install` for dependency installation, `npm run build` for the build command, and `apps/web/dist` as the output directory. Keep the API as a separately configured Python function or service; do not proxy it to the local `127.0.0.1:8000` development API. Vercel's Python runtime can host FastAPI but is currently marked Beta, so treat it as a deployment decision to validate in staging.
-2. Create a Supabase project and apply versioned SQL migrations from `supabase/migrations/`. The migrations must cover workspace membership/roles, sites, assets, inventory, suppliers, triggers, actions, field tasks/reports, audit events, idempotency keys, and an outbox/job table. Enable RLS on every browser-accessible table and write policies that scope data by verified workspace membership. Preserve atomic policy checks, budget reservation, and audit updates in database transactions.
-3. Replace `SQLiteRepository` with a Postgres repository implementation. The current one-record SQLite repository is a local adapter, not a production schema. Move attachments to a private Supabase Storage bucket. Upload directly from the worker browser using short-lived signed access; store object paths, content hashes, report IDs, and idempotency keys in Postgres. Never fetch all image data on every state refresh.
-4. Connect the sign-in form to Supabase Auth. Store roles in trusted workspace membership or server-managed app metadata, never user-editable profile metadata. Validate the JWT on every API call, protect admin mutation endpoints, and filter worker tasks by the authenticated worker ID. Delete the local account constants before any hosted build. Keep the same single sign-in page; route after the server verifies the user's role.
-5. Add the Firebase web app and FCM web-push certificate. Configure the HTTPS site, notification permission flow, root `firebase-messaging-sw.js`, and public VAPID key. Store each user's device registration in a user-scoped table and send from a server-side notification adapter with Firebase Admin credentials held only in server environment variables. Push is a delivery hint; database task state remains authoritative.
-6. Replace the local 5-second loop with durable, idempotent event processing. Write a job/outbox row in the same transaction as each trigger-worthy update, then process it through a scheduled function or a dedicated worker. Vercel Cron can call `GET /api/cron/agent` with `CRON_SECRET` as a bearer header; this repository includes the local FastAPI route and the secret check. Before enabling it in production, move that handler to the deployed API runtime and add Postgres advisory locking/leases, unique event keys, retries, and reconciliation for missed or duplicated invocations. Cron is best-effort and Vercel does not retry failures automatically.
-7. Choose schedule frequency against the actual escalation service level. Vercel Hobby permits one daily cron run; Pro and Enterprise permit a minimum interval of one minute. Neither supports the current five-second polling behavior. Use a durable queue or always-on worker if dispatch and reassignment need sub-minute response.
-8. Add provider adapters for live telemetry/SCADA, CMMS/workforce directory, inventory/procurement, and weather only when those accounts and API details are available. Keep each behind an interface and ship mock fixtures for local development. Configure the LLM endpoint/model/key server-side if AI risk review is enabled; AI may add risk or request review, while database policy alone authorizes actions.
-9. Configure production secrets in Vercel/Supabase secret settings. Never use `VITE_*` variables for server credentials. At minimum, plan for Supabase URL and anon key (browser), Supabase server connection credentials (server only), `CRON_SECRET`, Firebase server credentials, optional LLM base URL/model/API key, and provider credentials. Rotate the temporary local passwords and never ship local account values.
-10. Before opening the site to users: apply migrations to a staging project, add automated tests for RLS and cross-workspace access, verify signed-upload limits and offline sync conflict behavior, test repeated/overlapping job execution, check logs/alerts/backups, set CORS and Auth redirect URLs to the real domains, then promote the same migration and build to production.
+1. Vercel is configured by `vercel.json`: repository root, `npm run build`, and `apps/web/dist`. Vite deep links use the SPA rewrite; `api/index.py` routes `/api/*` to FastAPI. FastAPI's Python runtime is still Beta, so validate a preview deployment before treating this as a production service.
+2. The four Supabase migrations recorded in `supabase/migrations/README.md` have been applied to the Workkite project. They provision workspace membership, roles, a locked Postgres state record, media metadata, RLS policies, an Auth bootstrap trigger, and a private evidence bucket. The first invited Auth account becomes the initial workspace admin; later invited accounts become workers.
+3. The backend now has a Postgres repository adapter. Local mode remains SQLite; hosted mode requires `WORKKITE_ENV=production` and server-side Supabase settings. State reads/mutations are scoped to the workspace found from the authenticated membership, and PostgreSQL row locks keep updates atomic. Do not deploy until all environment variables are set and Vercel's build passes.
+4. The sign-in form uses Supabase Auth when its public URL/key are configured. The API verifies every access token with Supabase Auth, reads the user's RLS-protected workspace membership, protects admin routes, and filters worker data. Role decisions never come from browser storage or user-editable profile metadata.
+5. Evidence is still stored through the Postgres media adapter for this first hosted integration. The private Supabase Storage bucket is provisioned, but direct uploads and signed reads remain a follow-up before storing production photos/audio at scale.
+6. The local five-second loop is not started in hosted mode. The authenticated cron handler can run deterministic rules across workspaces when scheduled, but no schedule is enabled yet. Vercel Hobby permits daily schedules only; minute-level scheduling requires Pro or Enterprise. Live wallet access, direct media uploads to Storage, AI, and external providers remain disabled. Do not enable automatic purchases until the wallet adapter is implemented and tested.
+7. Before inviting anyone, turn off public Auth sign-up and set Supabase Auth's Site URL to `https://workkite.vercel.app` (allow that URL as a redirect). Invite the first admin through Supabase Auth; the database trigger creates the workspace and assigns that invited account admin. Later Auth Dashboard invitations are assigned the worker role automatically. Uninvited sign-ups receive no role or workspace access.
 
 ## Repository organization
 
 - `apps/web`: static Vite user interface and offline field shell.
 - `apps/api`: FastAPI routes, trigger evaluator, policy gate, and replaceable repository/provider adapters.
-- `supabase/migrations`: production schema/RLS migrations (to be added with the Postgres adapter, before first hosted deployment).
-- `deploy/vercel-supabase`: deployment environment template and deployment-specific configuration (to be added once the hosted API entry point is selected).
+- `supabase/migrations`: versioned production schema/RLS migrations.
+- `deploy/vercel-supabase`: deployment environment template and platform setup notes.
 - `docs/integrations.md`: per-connector contracts and security boundaries.
 
-Keep deployment wiring out of local application logic. The eventual Vercel configuration should point at a small API entry point and the Vite build, while credentials stay in platform environment settings. Do not add a live `vercel.json` or claim one-command production deployment until the Postgres repository, verified auth, and deployed API routes exist.
+Platform credentials stay in Vercel environment settings. Keep automatic purchase/wallet execution disabled until a real provider and the remaining transaction safety checks are implemented.
 
 ## Environment inventory
 
 | Variable / secret | Where it belongs | Purpose |
 | --- | --- | --- |
-| `VITE_SUPABASE_URL` | Vercel web build | Public Supabase project URL |
-| `VITE_SUPABASE_PUBLISHABLE_KEY` | Vercel web build | Public client key, restricted by RLS |
-| `SUPABASE_DATABASE_URL` or managed connection string | API runtime only | Postgres connection; use pooler settings suitable for serverless |
-| `CRON_SECRET` | API runtime and Vercel Cron settings | Authenticate scheduled invocations |
-| `FIREBASE_PROJECT_ID`, service credentials | API runtime only | FCM server sends |
-| `VITE_FIREBASE_*`, `VITE_FIREBASE_VAPID_KEY` | Vercel web build | Firebase client config and public web-push key |
-| `WORKKITE_LLM_BASE_URL`, `WORKKITE_LLM_MODEL`, `WORKKITE_LLM_API_KEY` | API runtime only | Optional AI risk reviewer |
-| `SCADA_*`, `CMMS_*`, `SUPPLIER_*`, `WEATHER_*` | API runtime only | Only for integrations that are selected and provisioned |
+| `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY` | Vercel web build | Supabase Auth client |
+| `WORKKITE_ENV=production` | Vercel API runtime | Select production auth and Postgres adapters |
+| `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY` | Vercel API runtime | Verify bearer tokens and workspace membership |
+| `SUPABASE_DATABASE_URL` | Vercel API runtime only | Supabase transaction-pooler Postgres connection string |
+| `CRON_SECRET` | Vercel API runtime | Required only if enabling the scheduled rules endpoint |
 
-The Supabase publishable key and Firebase web config are designed for clients, but database access must still be constrained by RLS. Service-role, database, Firebase Admin, LLM, scheduler, and vendor API secrets must never be included in browser bundles.
+The Supabase publishable key is designed for clients. Database and Auth access remains constrained by verified membership and RLS. Database connection strings and other server credentials must never be included in browser bundles.
 

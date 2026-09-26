@@ -1,4 +1,5 @@
 import type { Method, State } from "./types";
+import { authClient } from "./auth";
 
 export async function request<T>(
   path: string,
@@ -6,10 +7,15 @@ export async function request<T>(
   method?: Method,
 ): Promise<T> {
   const verb = method ?? (body === undefined ? "GET" : "POST");
+  const { data } = authClient ? await authClient.auth.getSession() : { data: { session: null } };
   const response = await fetch(`/api${path}`, {
     method: verb,
-    headers:
-      body === undefined ? undefined : { "Content-Type": "application/json" },
+    headers: {
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      ...(data.session?.access_token
+        ? { Authorization: `Bearer ${data.session.access_token}` }
+        : {}),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(10000),
   });
@@ -33,6 +39,19 @@ export const sendCommand = (
 ) => request<{ state: State; message: string }>(path, body, method);
 export const mediaUrl = (reportId: string, kind: "photo" | "audio") =>
   `/api/reports/${encodeURIComponent(reportId)}/media/${kind}`;
+export async function loadEvidence(reportId: string, kind: "photo" | "audio") {
+  const { data } = authClient
+    ? await authClient.auth.getSession()
+    : { data: { session: null } };
+  const response = await fetch(mediaUrl(reportId, kind), {
+    headers: data.session?.access_token
+      ? { Authorization: `Bearer ${data.session.access_token}` }
+      : undefined,
+    signal: AbortSignal.timeout(25000),
+  });
+  if (!response.ok) throw new Error("Evidence could not be loaded.");
+  return URL.createObjectURL(await response.blob());
+}
 export const money = (cents: number) =>
   new Intl.NumberFormat("en-US", {
     style: "currency",

@@ -7,6 +7,8 @@ __pycache__/
 *.db
 *.db-shm
 *.db-wal
+apps/api/None
+supabase/.temp/
 .env
 .env.*
 !.env.example

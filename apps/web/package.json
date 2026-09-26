@@ -9,10 +9,11 @@
     "preview": "vite preview --host 127.0.0.1 --port 4173"
   },
   "dependencies": {
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
+    "@supabase/supabase-js": "2.117.2",
+    "idb-keyval": "^6.2.2",
     "lucide-react": "^0.468.0",
-    "idb-keyval": "^6.2.2"
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
   },
   "devDependencies": {
     "@types/react": "^19.2.0",
