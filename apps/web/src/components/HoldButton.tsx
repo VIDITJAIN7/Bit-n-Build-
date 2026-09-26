@@ -65,9 +65,7 @@ export function HoldButton({
         <span>{armed ? "Press again to confirm" : children}</span>
       </button>
       <small>
-        {armed
-          ? "Review the action, then activate again."
-          : "Hold 1 second · Keyboard: activate twice"}
+        {armed ? "Activate again to confirm." : "Hold 1 second or press twice."}
       </small>
     </div>
   );

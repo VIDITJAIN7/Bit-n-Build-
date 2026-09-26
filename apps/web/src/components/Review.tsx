@@ -27,14 +27,8 @@ export function Review({
 }) {
   const [role, setRole] = useState("owner");
   const [filter, setFilter] = useState("all");
-  const [readback, setReadback] = useState<Record<string, string>>({});
   const [acknowledged, setAcknowledged] = useState<Record<string, boolean>>({});
   const actor = role === "owner" ? state.wallet.owner : "backup";
-  const stats = state.drills.stats[actor] || {
-    caught: 0,
-    missed: 0,
-    enhanced: false,
-  };
   const siteName = (id: string) =>
     state.sites.find((site) => site.id === id)?.name ?? "Unknown site";
   const pending = state.actions.filter(
@@ -49,69 +43,26 @@ export function Review({
     <>
       <div className="page-heading">
         <div>
-          <p className="eyebrow">
-            <span />
-            MEANINGFUL HUMAN CONTROL
-          </p>
-          <h1>The decisions that need you.</h1>
-          <p className="subtitle">
-            Review the evidence. Authorize an exact action, once.
-          </p>
+          <h1>Review</h1>
         </div>
         <label className="role-select">
           <UserRound size={16} />
           <span>
-            Demo authorizer
+            Approver
             <select value={role} onChange={(e) => setRole(e.target.value)}>
               <option value="owner">
-                {state.wallet.owner === "supervisor"
-                  ? "Maya · Supervisor"
-                  : "Leena · New supervisor"}
+                Primary approver
               </option>
               <option
                 value="backup"
                 disabled={!state.supervision.backup_active}
               >
-                Omar · Backup approver
+                Backup approver
               </option>
             </select>
           </span>
         </label>
       </div>
-      <section className="drill-banner">
-        <ShieldCheck size={23} />
-        <div>
-          <strong>Announced attention drills</strong>
-          <p>
-            When enabled, each new planned action has a 3% chance of adding a
-            deliberately incorrect payment request. Exercises never execute and
-            are revealed immediately after your decision. The demo button
-            inserts one on demand.
-          </p>
-        </div>
-        <button
-          className="button secondary"
-          disabled={busy}
-          onClick={() =>
-            command("/drills", {
-              operation: state.drills.enabled ? "disable" : "enable",
-            })
-          }
-        >
-          {state.drills.enabled
-            ? "Disable program"
-            : "Enable announced program"}
-        </button>
-        {state.drills.enabled && (
-          <button
-            className="button primary"
-            disabled={busy}
-            onClick={() => command("/drills", { operation: "inject" })}
-          >
-            Add demo drill
-          </button>
-        )}
-      </section>
       {state.supervision.backup_active && (
         <div className="availability-banner">
           <UserRound size={20} />
@@ -120,27 +71,12 @@ export function Review({
               Escalation window missed — backup approver available
             </strong>
             <p>
-              Omar can handle pending decisions now. Guardian recovery is a
+              The backup approver can handle pending decisions now. Guardian recovery is a
               separate, longer process.
             </p>
           </div>
         </div>
       )}
-      <div className="drill-stats">
-        <span>
-          This reviewer:{" "}
-          <strong>
-            {stats.caught} caught / {stats.caught + stats.missed} completed
-            drills
-          </strong>
-        </span>
-        <span>
-          {stats.enhanced
-            ? "Enhanced review active: destination readback required"
-            : "Standard review friction"}
-        </span>
-        <span>Drill outcomes are not a validated attention score.</span>
-      </div>
       <div className="review-toolbar">
         <div className="tabs">
           <button
@@ -159,21 +95,11 @@ export function Review({
             </span>
           </button>
         </div>
-        <span className="muted small-text">
-          Role selection simulates separate people locally
-        </span>
       </div>
       {!displayed.length && (
         <div className="panel empty">
           <ShieldCheck size={36} />
-          <h2>No decisions waiting.</h2>
-          <p>
-            The background agent routes only exceptions here. Everything it
-            handled within policy is in the activity log.
-          </p>
-          <button className="button secondary" onClick={() => go("control")}>
-            Back to control panel
-          </button>
+          <h2>No pending items.</h2>
         </div>
       )}
       <div className="review-cards">
@@ -208,13 +134,13 @@ export function Review({
                       {siteName(action.site_id)}
                     </p>
                     <p className="provenance">
-                      Raised by trigger “{action.trigger_name}” ·{" "}
+                      From task “{action.trigger_name}” ·{" "}
                       {action.subject.code}
                     </p>
                   </div>
                   <strong>
                     {money(action.amount_cents)}
-                    <small>USDC equivalent</small>
+                    <small>Amount</small>
                   </strong>
                 </div>
                 <div className="review-columns">
@@ -255,7 +181,7 @@ export function Review({
                       </strong>
                       <small>
                         {action.field_confirmed === true
-                          ? "Evidence received by the local server. Human authorization is still required."
+                          ? "Evidence received. Approval is still required."
                           : action.field_confirmed === false
                             ? "Approval stays blocked. Request another check if conditions change."
                             : `The technician will be asked: “${question}”`}
@@ -266,7 +192,7 @@ export function Review({
                         className="link-button"
                         onClick={() => go("field")}
                       >
-                        Open field console <ArrowRight size={15} />
+                        Open worker tasks <ArrowRight size={15} />
                       </button>
                     ) : action.field_confirmed !== true ? (
                       <button
@@ -313,9 +239,6 @@ export function Review({
                           <div key={attachment.kind}>
                             <small>
                               {attachment.name}
-                              {attachment.demo_fixture
-                                ? " · DEMO FIXTURE, NOT A REAL SITE PHOTO"
-                                : ""}
                             </small>
                             {attachment.kind === "photo" ? (
                               <img
@@ -349,30 +272,10 @@ export function Review({
                   ))}
                 </div>
                 <div className="review-footer">
-                  {stats.enhanced && (
-                    <label className="readback-label">
-                      Enhanced review: type the exact payment destination
-                      <input
-                        value={readback[action.id] || ""}
-                        onChange={(e) =>
-                          setReadback({
-                            ...readback,
-                            [action.id]: e.target.value,
-                          })
-                        }
-                        placeholder="Read it from the evidence above"
-                        autoComplete="off"
-                      />
-                    </label>
-                  )}
                   <label className="acknowledge">
                     <input
                       type="checkbox"
-                      checked={
-                        !!acknowledged[action.id] ||
-                        (stats.enhanced &&
-                          readback[action.id] !== action.recipient)
-                      }
+                      checked={!!acknowledged[action.id]}
                       onChange={(e) =>
                         setAcknowledged({
                           ...acknowledged,
@@ -405,15 +308,12 @@ export function Review({
                         !!needsEvidence ||
                         alreadySigned ||
                         wrongFirst ||
-                        !acknowledged[action.id] ||
-                        (stats.enhanced &&
-                          readback[action.id] !== action.recipient)
+                        !acknowledged[action.id]
                       }
                       onConfirm={() =>
                         void command(`/actions/${action.id}/decision`, {
                           actor,
                           decision: "approve",
-                          readback: readback[action.id] || "",
                         })
                       }
                     >
@@ -432,29 +332,10 @@ export function Review({
             );
           })}
       </div>
-      {state.actions
-        .filter((a) => a.status === "drill_resolved")
-        .slice(-1)
-        .map((a) => (
-          <div className="drill-reveal" key={a.id}>
-            <strong>
-              Training reveal ·{" "}
-              {a.drill_result === "caught"
-                ? "Mismatch caught"
-                : "Mismatch missed"}
-            </strong>
-            <p>
-              The destination {a.recipient} was a lookalike of{" "}
-              {a.canary_expected}. This request could never execute. Two
-              successfully rejected drills restore standard friction after a
-              miss.
-            </p>
-          </div>
-        ))}
       <p className="footnote">
         <ShieldCheck size={14} />
         Risk scores explain the routing. Server-side policy, evidence, and
-        authority determine whether an action can execute.
+        workspace policy, evidence, and access rules determine whether an action can proceed.
       </p>
     </>
   );

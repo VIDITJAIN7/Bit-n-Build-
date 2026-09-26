@@ -1,15 +1,18 @@
 import asyncio
 import base64
+import json
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from .adapters import AIReviewPlanner, LocalPlanner, OpenAICompatibleRiskReviewer
 from .repository import SQLiteRepository
 from .service import DomainError, OperationsService
 
@@ -42,6 +45,13 @@ class ComplianceChecklist(StrictModel):
     protective_equipment_checked: bool
 
 
+class ReportFieldDefinition(StrictModel):
+    key: Key
+    label: Label
+    type: Literal["text", "number", "yes_no"]
+    required: bool = True
+
+
 class Attachment(StrictModel):
     kind: Literal["photo", "audio"]
     name: str = Field(min_length=1, max_length=200)
@@ -60,6 +70,7 @@ class Report(StrictModel):
     created_at: str = Field(min_length=10, max_length=50)
     asset_code: str = Field(min_length=1, max_length=40)
     checklist: ComplianceChecklist
+    responses: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=12)
     attachments: list[Attachment] = Field(min_length=1, max_length=2)
 
 
@@ -76,6 +87,8 @@ class TriggerAction(StrictModel):
     supplier_id: str | None = Field(default=None, max_length=60)
     amount_cents: Cents | None = None
     requires_field_check: bool = False
+    report_fields: list[ReportFieldDefinition] = Field(default_factory=list, max_length=12)
+    assignee: str = Field(default="", max_length=80)
 
 
 class TriggerDraft(StrictModel):
@@ -93,6 +106,11 @@ class TriggerDraft(StrictModel):
 
 class Toggle(StrictModel):
     enabled: bool
+
+
+class LoginRequest(StrictModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=256)
 
 
 class AgentSettings(StrictModel):
@@ -193,17 +211,50 @@ async def agent_loop(service, interval):
         await asyncio.sleep(interval)
 
 
+def setting(name, default="", legacy_name=None):
+    if name in os.environ:
+        return os.environ[name]
+    if legacy_name and legacy_name in os.environ:
+        return os.environ[legacy_name]
+    return default
+
+
 def create_app(database_path=None, agent_interval=None):
-    for name, allowed in (("AVERLOCK_AGENT", "local"), ("AVERLOCK_WALLET", "simulated")):
-        if os.getenv(name, allowed) != allowed:
-            raise RuntimeError(f"{name}: external adapters are not configured. Use {allowed}.")
+    agent_mode = setting("WORKKITE_AGENT", "rules", "AVERLOCK_AGENT").strip().lower()
+    if agent_mode in {"rules", "local"}:
+        planner = LocalPlanner()
+    elif agent_mode in {"ai-risk", "openai-compatible"}:
+        required = (
+            ("WORKKITE_LLM_BASE_URL", "AVERLOCK_LLM_BASE_URL"),
+            ("WORKKITE_LLM_MODEL", "AVERLOCK_LLM_MODEL"),
+            ("WORKKITE_LLM_API_KEY", "AVERLOCK_LLM_API_KEY"),
+        )
+        missing = [name for name, legacy in required if not setting(name, "", legacy)]
+        if missing:
+            raise RuntimeError(f"AI agent requires configuration: {', '.join(missing)}")
+        reviewer = OpenAICompatibleRiskReviewer(
+            setting("WORKKITE_LLM_BASE_URL", legacy_name="AVERLOCK_LLM_BASE_URL"),
+            setting("WORKKITE_LLM_API_KEY", legacy_name="AVERLOCK_LLM_API_KEY"),
+            setting("WORKKITE_LLM_MODEL", legacy_name="AVERLOCK_LLM_MODEL"),
+        )
+        planner = AIReviewPlanner(reviewer)
+    else:
+        raise RuntimeError("WORKKITE_AGENT must be 'rules' or 'ai-risk'.")
+    if setting("WORKKITE_WALLET", "local", "AVERLOCK_WALLET") not in {"local", "simulated"}:
+        raise RuntimeError("External wallet adapter is not configured.")
     interval = (
-        float(os.getenv("AVERLOCK_AGENT_INTERVAL", "5")) if agent_interval is None else agent_interval
+        float(setting("WORKKITE_AGENT_INTERVAL", "5", "AVERLOCK_AGENT_INTERVAL"))
+        if agent_interval is None
+        else agent_interval
     )
     db = database_path or os.getenv(
-        "AVERLOCK_DATABASE", str(Path(__file__).parents[1] / "data" / "averlock.db")
+        setting(
+            "WORKKITE_DATABASE",
+            str(Path(__file__).parents[1] / "data" / "averlock.db"),
+            "AVERLOCK_DATABASE",
+        )
     )
-    service = OperationsService(SQLiteRepository(str(db)))
+    service = OperationsService(SQLiteRepository(str(db)), agent=planner)
     service.interval = interval
 
     @asynccontextmanager
@@ -220,7 +271,7 @@ def create_app(database_path=None, agent_interval=None):
     app = FastAPI(
         title="Averlock local operations API",
         version="0.2.0",
-        description="Local demo roles are simulated, not authentication. Bind to loopback only.",
+        description="Local operations API. Authentication and wallet adapters are not configured; bind to loopback only.",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -245,7 +296,41 @@ def create_app(database_path=None, agent_interval=None):
 
     @app.get("/api/health")
     def health():
-        return {"status": "ok", "mode": "local", "agent": "deterministic", "wallet": "simulated"}
+        return {
+            "status": "ok",
+            "mode": "local",
+            "agent": service.agent.mode,
+            "wallet": "simulated",
+        }
+
+    @app.post("/api/auth/login")
+    def login(body: LoginRequest):
+        """Local role routing from server-side configuration; not production auth."""
+        configured = os.getenv("WORKKITE_LOCAL_USERS_JSON", "[]")
+        try:
+            users = json.loads(configured)
+        except json.JSONDecodeError as error:
+            logger.error("WORKKITE_LOCAL_USERS_JSON is invalid JSON")
+            raise HTTPException(status_code=503, detail="Sign-in is unavailable") from error
+        if not isinstance(users, list):
+            raise HTTPException(status_code=503, detail="Sign-in is unavailable")
+        email = body.email.strip().casefold()
+        account = next(
+            (
+                user
+                for user in users
+                if isinstance(user, dict)
+                and isinstance(user.get("email"), str)
+                and isinstance(user.get("password"), str)
+                and user.get("role") in {"admin", "worker"}
+                and secrets.compare_digest(user["email"].strip().casefold(), email)
+                and secrets.compare_digest(user["password"], body.password)
+            ),
+            None,
+        )
+        if account is None:
+            raise HTTPException(status_code=401, detail="Email or password is incorrect")
+        return {"email": email, "role": account["role"]}
 
     @app.get("/api/state")
     def state():
@@ -257,6 +342,16 @@ def create_app(database_path=None, agent_interval=None):
 
     @app.post("/api/agent/cycle")
     def agent_cycle():
+        return command(service.cycle)
+
+    @app.get("/api/cron/agent")
+    def scheduled_agent_cycle(authorization: str | None = Header(default=None)):
+        cron_secret = os.getenv("CRON_SECRET", "")
+        if not cron_secret:
+            raise HTTPException(status_code=503, detail="Scheduled agent is not configured")
+        supplied = authorization.removeprefix("Bearer ") if authorization else ""
+        if not secrets.compare_digest(supplied, cron_secret):
+            raise HTTPException(status_code=401, detail="Unauthorized scheduled request")
         return command(service.cycle)
 
     @app.post("/api/triggers")

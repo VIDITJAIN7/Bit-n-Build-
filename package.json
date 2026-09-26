@@ -1,5 +1,5 @@
 {
-  "name": "averlock",
+  "name": "workkite",
   "version": "0.1.0",
   "private": true,
   "workspaces": [
@@ -9,11 +9,11 @@
   "scripts": {
     "setup": "npm install && python scripts/setup.py",
     "dev": "node scripts/dev.mjs",
-    "dev:web": "npm run dev --workspace @averlock/web",
-    "build": "npm run build --workspace @averlock/web",
-    "test": "python scripts/test_api.py && npm run test --workspace @averlock/contracts",
+    "dev:web": "npm run dev --workspace @workkite/web",
+    "build": "npm run build --workspace @workkite/web",
+    "test": "python scripts/test_api.py && npm run test --workspace @workkite/contracts",
     "test:api": "python scripts/test_api.py",
-    "test:contracts": "npm run test --workspace @averlock/contracts"
+    "test:contracts": "npm run test --workspace @workkite/contracts"
   },
   "engines": {
     "node": ">=22.12.0"

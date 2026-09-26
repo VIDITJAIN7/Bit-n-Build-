@@ -13,7 +13,15 @@ OPS_BY_TYPE = {
     "text": {"eq", "neq", "contains"},
     "boolean": {"eq", "neq"},
 }
-SYMBOLS = {"gt": ">", "gte": "≥", "lt": "<", "lte": "≤", "eq": "=", "neq": "≠", "contains": "contains"}
+SYMBOLS = {
+    "gt": ">",
+    "gte": "≥",
+    "lt": "<",
+    "lte": "≤",
+    "eq": "=",
+    "neq": "≠",
+    "contains": "contains",
+}
 IDENTITY = {"id", "site_id"}
 RESERVED = {"id", "site_id", "site", "code", "name", "type", "sku", "metrics"}
 LABELS = {
@@ -152,7 +160,11 @@ def matches(trigger, row):
 
 
 def evaluate(state, trigger):
-    return [row for row in records(state, trigger["source"], trigger["site_id"]) if matches(trigger, row)]
+    return [
+        row
+        for row in records(state, trigger["source"], trigger["site_id"])
+        if matches(trigger, row)
+    ]
 
 
 def render(template, row):
@@ -263,6 +275,14 @@ def normalize(state, draft):
             raise ValueError("Write the confirmation question for the technician")
     else:
         then.update(supplier_id=None, amount_cents=None, requires_field_check=False)
+    needs_field_form = kind == "field_check" or (
+        kind == "purchase" and then["requires_field_check"]
+    )
+    report_fields = then.get("report_fields", []) if needs_field_form else []
+    keys = [field["key"] for field in report_fields]
+    if len(keys) != len(set(keys)):
+        raise ValueError("Each worker report field needs a unique key")
+    then["report_fields"] = report_fields
     return {
         "name": draft["name"].strip(),
         "description": draft.get("description", "").strip(),

@@ -19,7 +19,7 @@ export function Audit({ state }: { state: State }) {
           JSON.stringify(
             {
               exported_at: new Date().toISOString(),
-              mode: "local-demo",
+              mode: "local",
               events: state.audit,
               receipts: state.wallet.receipts,
             },
@@ -32,7 +32,7 @@ export function Audit({ state }: { state: State }) {
     );
     const link = document.createElement("a");
     link.href = url;
-    link.download = "averlock-audit.json";
+    link.download = "workkite-activity.json";
     link.click();
     URL.revokeObjectURL(url);
   }
@@ -40,15 +40,7 @@ export function Audit({ state }: { state: State }) {
     <>
       <div className="page-heading">
         <div>
-          <p className="eyebrow">
-            <span />
-            TRACE EVERY DECISION
-          </p>
-          <h1>A record you can follow.</h1>
-          <p className="subtitle">
-            Proposals, evidence, approvals, and execution in one local audit
-            trail.
-          </p>
+          <h1>Activity</h1>
         </div>
         <button
           className="button secondary"
@@ -62,7 +54,7 @@ export function Audit({ state }: { state: State }) {
       <section className="panel">
         <div className="panel-heading">
           <h2>
-            Activity log <span className="count">{state.audit.length}</span>
+            Activity <span className="count">{state.audit.length}</span>
           </h2>
           <label className="search">
             <Search size={16} />
@@ -100,21 +92,13 @@ export function Audit({ state }: { state: State }) {
               <h2>
                 {query
                   ? "No matching activity."
-                  : "The story starts with an action."}
+                  : "No activity yet."}
               </h2>
-              <p>
-                {query
-                  ? "Try another search term."
-                  : "Run the demo scenario to create your first audit events."}
-              </p>
+              {query && <p>Try another search term.</p>}
             </div>
           )}
         </div>
       </section>
-      <p className="footnote">
-        This is a local SQLite audit log, not an immutable or externally
-        attested ledger.
-      </p>
     </>
   );
 }

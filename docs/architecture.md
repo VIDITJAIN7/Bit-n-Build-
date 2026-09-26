@@ -1,6 +1,6 @@
 # Architecture
 
-Averlock is a local, connector-free operations control plane. Operators keep site data in the workspace, define triggers over it, and a background agent turns matches into proposals that pass through one deterministic policy gate. The web application talks only to a loopback FastAPI service. External planning, telemetry, weather, identity, database, and blockchain services are not connected.
+Workkite is a local, connector-free operations control plane. Operators keep site data in the workspace, define triggers over it, and a background agent turns matches into proposals that pass through one deterministic policy gate. The web application talks only to a loopback FastAPI service. External planning, telemetry, weather, identity, database, and blockchain services are not connected.
 
 ```mermaid
 flowchart TD
@@ -51,7 +51,9 @@ A trigger has a data source (assets or inventory), a site scope, one to six type
 
 Actions are deliberately few: raise an alert, create a work order, restock inventory, request a field check, or propose a fixed purchase. A purchase may require a technician's on-site confirmation before any approval is possible. Text templates can insert `{name}`, `{code}`, and `{site}` from the matched record.
 
-The agent loop runs inside the API process (`AVERLOCK_AGENT_INTERVAL`, default 5 s; `0` disables it). Each cycle optionally applies the simulated sensor feed, then evaluates every enabled automatic trigger. Evaluation is **edge-triggered**: a record fires when it starts matching, never twice while it keeps matching, and at most once per cooldown window after it clears. A record with an open item from the same trigger (a pending decision or an open field task) never fires again, so a rejected proposal stays rejected until its condition clears. Records resolved by the action itself, such as a completed restock, re-arm within the same cycle. Manual triggers are runbooks: they appear as buttons on the control panel and fire for every current match when pressed, skipping records that already have open items.
+For field checks and field-gated purchases, admins can define up to twelve worker report prompts as short text, number, or yes/no fields, each with a required flag. A dispatched task carries a snapshot of its configured form; the API rejects unrequested keys, missing required answers, and invalid response types. The Worker view hides the admin navigation and remains in high-contrast outdoor mode, with large targets, equipment-ID readback, hold-to-save, and the offline report queue.
+
+The agent loop runs inside the API process (`WORKKITE_AGENT_INTERVAL`, default 5 s; `0` disables it). Each cycle optionally applies the simulated sensor feed, then evaluates every enabled automatic trigger. Evaluation is **edge-triggered**: a record fires when it starts matching, never twice while it keeps matching, and at most once per cooldown window after it clears. A record with an open item from the same trigger (a pending decision or an open field task) never fires again, so a rejected proposal stays rejected until its condition clears. Records resolved by the action itself, such as a completed restock, re-arm within the same cycle. Manual triggers are runbooks: they appear as buttons on the control panel and fire for every current match when pressed, skipping records that already have open items.
 
 A trigger never executes anything itself. The planner turns each match into a proposal, and the policy gate alone decides what runs. The restock planner compares approved suppliers' price and lead time against the site's next visit, so a cheaper six-day supplier loses to an approved two-day supplier when the visit is in three days.
 
@@ -86,7 +88,7 @@ Demo clock controls exist only in the local simulator. The smart contract uses b
 
 Field tasks come from two places: a trigger whose action is a field check, or a supervisor requesting verification on a gated purchase. Each task carries its question and the equipment code the technician must match.
 
-The browser commits records to IndexedDB before saying they are saved. Records include a UUID, the task ID, the yes/no answer, equipment code, three compliance observations, capture timestamp, required image, and optional voice/text note. Photos and audio are limited to 2.8 MB each in the UI; backend payload fields are bounded too. The server assigns a separate confirmation timestamp.
+The browser commits records to IndexedDB before saying they are saved. Records include a UUID, the task ID, the yes/no answer, configured typed responses, equipment code, three compliance observations, capture timestamp, required image, and optional voice/text note. Photos are resized and compressed in the browser to fit the bounded request; audio is limited to 2.8 MB. The server assigns a separate confirmation timestamp.
 
 Sync retries reuse the UUID. An identical retry succeeds without duplicate evidence or audit events. A changed payload with the same UUID is rejected. An unsent record remains locally saved when sync fails. New evidence invalidates any previous approvals on the linked action. Evidence media is stored in its own SQLite table, fingerprinted with SHA-256 in the state document, and served from `/api/reports/{id}/media/{kind}`, so the state the UI polls every few seconds stays small.
 
@@ -94,8 +96,9 @@ The production service worker precaches the built application shell; API respons
 
 ## Important limits of this build
 
-The local HTTP service is intentionally an unauthenticated demo bound to `127.0.0.1`. Role dropdowns, guardian buttons, clock advances, sample evidence, the sensor feed, and wallet payments are simulations. They must not be exposed as a production authorization system.
+The local HTTP service binds to `127.0.0.1`. Local sign-in reads role assignments from API-host configuration, but API routes remain unauthenticated and the local payment and synthetic-data adapters are not production integrations. Do not expose this service publicly until verified identity and authorization protect every route.
 
 SQLite stores a single atomic state document for simplicity, trimmed to the most recent 300 actions and 400 audit events (pending items are always kept). Use relational tables, identity-scoped access, and append-only audit storage when integrating a real database. Media belongs in authenticated object storage in production. Neither the prototype nor sample evidence certifies workplace safety or regulatory compliance.
 
 The Solidity wallet is independently tested but not wired to the UI and is not audited. The contract prevents an agent key from bypassing its immutable financial limits; it cannot itself determine whether a photo proves an equipment fault or whether a human paid attention. That evidence binding needs an authenticated integration before live use.
+

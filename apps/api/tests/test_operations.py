@@ -5,10 +5,10 @@ import time
 from copy import deepcopy
 
 import pytest
-from averlock.adapters import SimulatedFeed, SimulatedWallet
+from averlock.adapters import AIReviewPlanner, SimulatedFeed, SimulatedWallet
 from averlock.main import create_app
 from averlock.policy import evaluate
-from averlock.seed import initial_state
+from averlock.seed import initial_state, migrate_state
 from fastapi.testclient import TestClient
 
 PHOTO = (
@@ -20,6 +20,33 @@ PHOTO = (
 @pytest.fixture
 def client(tmp_path):
     return TestClient(create_app(tmp_path / "test.db", agent_interval=0))
+
+
+def test_local_sign_in_uses_server_configuration(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "WORKKITE_LOCAL_USERS_JSON",
+        json.dumps(
+            [
+                {
+                    "email": "admin@company.local",
+                    "password": "secret-value",
+                    "role": "admin",
+                }
+            ]
+        ),
+    )
+    with TestClient(create_app(tmp_path / "auth.db", agent_interval=0)) as auth:
+        response = auth.post(
+            "/api/auth/login",
+            json={"email": "ADMIN@COMPANY.LOCAL", "password": "secret-value"},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"email": "admin@company.local", "role": "admin"}
+        denied = auth.post(
+            "/api/auth/login",
+            json={"email": "admin@company.local", "password": "wrong"},
+        )
+        assert denied.status_code == 401
 
 
 def post(client, path, body=None, status=200, method="post"):
@@ -72,6 +99,11 @@ def report(task_id, id="report-unique-001", answer=True, code="INV-04"):
             "work_area_checked": True,
             "protective_equipment_checked": True,
         },
+        "responses": {
+            "fault_indicator": True,
+            "measured_temperature": 78,
+            "technician_notes": "Observed on front panel",
+        },
         "attachments": [
             {"kind": "photo", "name": "test.png", "data_url": PHOTO, "demo_fixture": True}
         ],
@@ -83,6 +115,59 @@ def verify(client, answer=True):
     state = post(client, f"/actions/{action['id']}/verification")["state"]
     task = next(t for t in state["field_tasks"] if t["action_id"] == action["id"])
     return action, post(client, "/reports", report(task["id"], answer=answer))
+
+
+def test_ai_review_planner_only_adds_assessment_to_configured_proposals():
+    class FixedReviewer:
+        def review(self, context):
+            assert context["trigger"]["name"] == "Overheating equipment"
+            assert "recipient" not in str(context)
+            assert "location" not in str(context)
+            assert context["record"]["code"] == "INV-07"
+            return {"score": 76, "flags": ["Unexpectedly high temperature"], "available": True}
+
+    state = initial_state()
+    trigger = next(item for item in state["triggers"] if item["id"] == "trg-overheat")
+    row = next(item for item in state["assets"] if item["id"] == "inv-07")
+    proposal = AIReviewPlanner(FixedReviewer()).propose(
+        {"state": state, "trigger": trigger, "record": row}
+    )[0]
+    assert proposal["kind"] == "work_order"
+    assert proposal["ai_risk"]["score"] == 76
+    assert proposal["title"] == "Inspect cooling on Inverter 07"
+
+
+def test_scheduled_agent_route_requires_configured_bearer_secret(monkeypatch, tmp_path):
+    app = create_app(tmp_path / "cron.db", agent_interval=0)
+    with TestClient(app) as scheduled_client:
+        assert scheduled_client.get("/api/cron/agent").status_code == 503
+        monkeypatch.setenv("CRON_SECRET", "private-test-scheduler-secret")
+        assert scheduled_client.get(
+            "/api/cron/agent", headers={"Authorization": "Bearer wrong"}
+        ).status_code == 401
+        response = scheduled_client.get(
+            "/api/cron/agent",
+            headers={"Authorization": "Bearer private-test-scheduler-secret"},
+        )
+        assert response.status_code == 200, response.text
+        assert "state" in response.json()
+
+
+def test_ai_risk_can_raise_review_friction_but_cannot_change_policy_permissions():
+    state = initial_state()
+    action = {"kind": "work_order", "amount_cents": 0, "evidence": True}
+    baseline = evaluate(state, action)
+    raised = evaluate(
+        state,
+        {
+            **action,
+            "ai_risk": {"score": 76, "flags": ["Unusual condition"], "available": True},
+        },
+    )
+    assert baseline["auto_allowed"]
+    assert not raised["auto_allowed"] and raised["level"] == "high"
+    assert raised["score"] >= 76 and "Unusual condition" in raised["reasons"]
+    assert not raised["hard_blocks"]
 
 
 def decision(client, action_id, actor="supervisor", choice="approve", status=200, readback=""):
@@ -103,9 +188,12 @@ def test_background_cycle_handles_routine_work_and_escalates_exceptions(client):
     pending = [a for a in state["actions"] if a["status"] == "pending"]
     assert {a["title"] for a in pending} == {"Order 20 × Air filter", "Replace Inverter 04"}
     assert replacement(state)["policy"]["level"] == "high"
-    assert "Purchase is 9.2× larger than typical site purchases" in replacement(state)["policy"]["reasons"]
+    assert (
+        "Purchase is 9.2× larger than typical site purchases"
+        in replacement(state)["policy"]["reasons"]
+    )
     assert state["stats"]["auto_handled"] == 6 and state["stats"]["alerts"] == 1
-    assert [t["subject_code"] for t in state["field_tasks"]] == ["FRZ-05"]
+    assert any(t["subject_code"] == "FRZ-05" for t in state["field_tasks"])
     assert state["wallet"]["balance_cents"] == 1500000 - 13600 - 9500 - 7800
     stock = {i["sku"]: i["stock"] for i in state["inventory"]}
     assert stock["X14"] == 2 and stock["BATT-C"] == 4 and stock["SEAL-G"] == 3
@@ -125,21 +213,74 @@ def test_operator_data_change_fires_matching_trigger(client):
     work_order = by_trigger(state, "trg-overheat", "inv-07")[0]
     assert work_order["kind"] == "work_order" and work_order["status"] == "executed"
     assert "temperature 85°C (> 70°C)" in work_order["explanation"]
+    task = next(t for t in state["field_tasks"] if t["action_id"] == work_order["id"])
+    assert task["status"] == "open" and task["assignee"] == "Alex Rivera"
 
 
 def test_custom_trigger_is_created_previewed_run_and_removed(client):
-    preview = post(client, "/triggers/preview", draft())
+    body = draft(
+        action={"type": "field_check", "question": "Is {code} charging?", "assignee": "Alex Worker"}
+    )
+    preview = post(client, "/triggers/preview", body)
     assert preview["count"] == 1 and preview["matches"][0]["code"] == "BAT-01"
-    state = post(client, "/triggers", draft())["state"]
+    state = post(client, "/triggers", body)["state"]
     trigger = next(t for t in state["triggers"] if t["name"] == "Battery running low")
     assert trigger["created_by"] == "operator" and trigger["runtime"]["matches"] == ["bat-01"]
     state = cycle(client)
     task = next(t for t in state["field_tasks"] if t["trigger_id"] == trigger["id"])
     assert task["question"] == "Is BAT-01 charging?" and task["status"] == "open"
+    assert task["assignee"] == "Alex Worker"
     post(client, f"/triggers/{trigger['id']}/enabled", {"enabled": False})
     post(client, f"/triggers/{trigger['id']}/run", status=409)
     state = post(client, f"/triggers/{trigger['id']}", method="delete")["state"]
     assert trigger["id"] not in {t["id"] for t in state["triggers"]}
+
+
+def test_task_rule_edits_update_open_worker_assignments(client):
+    body = draft(
+        action={
+            "type": "field_check",
+            "question": "Is {code} charging?",
+            "assignee": "Alex Worker",
+            "report_fields": [
+                {"key": "condition", "label": "Condition", "type": "text", "required": True}
+            ],
+        }
+    )
+    state = post(client, "/triggers", body)["state"]
+    trigger = next(t for t in state["triggers"] if t["name"] == body["name"])
+    task = next(
+        t for t in cycle(client)["field_tasks"] if t["trigger_id"] == trigger["id"]
+    )
+    completed = {**task, "id": "task-completed-copy", "status": "answered"}
+    client.app.state.service.repository.mutate(
+        lambda current: current["field_tasks"].append(completed)
+    )
+
+    edited = {
+        **body,
+        "action": {
+            **body["action"],
+            "question": "Does {code} show a charging fault?",
+            "assignee": "Priya Worker",
+            "report_fields": [
+                {"key": "fault", "label": "Fault code", "type": "text", "required": False}
+            ],
+        },
+    }
+    updated = post(client, f"/triggers/{trigger['id']}", edited, method="put")["state"]
+    active = next(t for t in updated["field_tasks"] if t["id"] == task["id"])
+    archived = next(
+        t for t in updated["field_tasks"] if t["id"] == "task-completed-copy"
+    )
+    assert active["question"] == "Does BAT-01 show a charging fault?"
+    assert active["assignee"] == "Priya Worker"
+    assert active["report_fields"] == edited["action"]["report_fields"]
+    assert archived["question"] == task["question"]
+    offline_report = report(task["id"], id="offline-report-001", code="BAT-01")
+    offline_report["responses"] = {"condition": "Charging normally"}
+    saved = post(client, "/reports", offline_report)["state"]["reports"][-1]
+    assert saved["responses"] == offline_report["responses"]
 
 
 @pytest.mark.parametrize(
@@ -165,7 +306,9 @@ def test_manual_runbook_only_runs_on_demand(client):
     state = cycle(client)
     assert not by_trigger(state, "trg-safety-walk")
     state = post(client, "/triggers/trg-safety-walk/run")["state"]
-    codes = sorted(t["subject_code"] for t in state["field_tasks"] if t["trigger_id"] == "trg-safety-walk")
+    codes = sorted(
+        t["subject_code"] for t in state["field_tasks"] if t["trigger_id"] == "trg-safety-walk"
+    )
     assert codes == ["FRZ-02", "FRZ-05"]
     again = post(client, "/triggers/trg-safety-walk/run")
     assert "Nothing new" in again["message"]
@@ -215,7 +358,9 @@ def test_field_retry_is_idempotent_and_conflicting_retry_rejected(client):
     post(client, "/reports", report(task_id))
 
 
-@pytest.mark.parametrize("mutation", ["missing_check", "wrong_asset", "missing_photo", "wrong_mime"])
+@pytest.mark.parametrize(
+    "mutation", ["missing_check", "wrong_asset", "missing_photo", "wrong_mime"]
+)
 def test_compliance_requirements_are_enforced_on_server(client, mutation):
     action = replacement(cycle(client))
     state = post(client, f"/actions/{action['id']}/verification")["state"]
@@ -229,6 +374,48 @@ def test_compliance_requirements_are_enforced_on_server(client, mutation):
     if mutation == "wrong_mime":
         data["attachments"][0]["data_url"] = "data:audio/webm;base64,YWJj"
     post(client, "/reports", data, 409)
+
+
+def test_seeded_solar_runbook_saves_configured_worker_fields(client):
+    state = post(client, "/triggers/trg-solar-array-check/run")["state"]
+    task = next(t for t in state["field_tasks"] if t["trigger_id"] == "trg-solar-array-check")
+    assert task["subject_id"] == "pv-01"
+    assert [field["key"] for field in task["report_fields"]] == [
+        "module_damage",
+        "soiling_pct",
+        "string_voltage",
+        "cleaning_notes",
+    ]
+    data = report(task["id"])
+    data["asset_code"] = "PV-01"
+    data["responses"] = {"module_damage": False, "soiling_pct": 12.5, "string_voltage": 981}
+    accepted = post(client, "/reports", data)["state"]["reports"][-1]
+    assert accepted["responses"] == data["responses"]
+
+
+def test_report_rejects_missing_or_wrongly_typed_configured_fields(client):
+    state = post(client, "/triggers/trg-solar-array-check/run")["state"]
+    task = next(t for t in state["field_tasks"] if t["trigger_id"] == "trg-solar-array-check")
+    data = report(task["id"])
+    data["asset_code"] = "PV-01"
+    data["responses"] = {"module_damage": True}
+    post(client, "/reports", data, 409)
+    data["responses"] = {"module_damage": "yes", "soiling_pct": "high"}
+    post(client, "/reports", data, 409)
+
+
+def test_workspace_migration_preserves_operator_data_and_adds_solar_runbooks():
+    old = initial_state()
+    old["schema_version"] = 2
+    old["workspace"]["name"] = "My edited workspace"
+    old["sites"][0]["name"] = "My solar site"
+    migrated = migrate_state(old)
+    assert migrated["workspace"]["name"] == "My edited workspace"
+    assert migrated["sites"][0]["name"] == "My solar site"
+    assert "pv-01" in {asset["id"] for asset in migrated["assets"]}
+    assert {"trg-solar-array-check", "trg-solar-soiling"} <= {
+        trigger["id"] for trigger in migrated["triggers"]
+    }
 
 
 def test_evidence_media_is_served_outside_the_state_document(client):
@@ -300,7 +487,9 @@ def test_bad_input_and_failed_approval_are_atomic(client):
     after = client.get("/api/state").json()
     assert after["supervision"]["last_owner_action"] == before["supervision"]["last_owner_action"]
     assert after["audit"] == before["audit"]
-    post(client, f"/actions/{action['id']}/decision", {"actor": "agent", "decision": "approve"}, 422)
+    post(
+        client, f"/actions/{action['id']}/decision", {"actor": "agent", "decision": "approve"}, 422
+    )
     post(
         client,
         f"/actions/{action['id']}/decision",

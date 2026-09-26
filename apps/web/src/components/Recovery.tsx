@@ -6,13 +6,10 @@ import {
   ShieldCheck,
   UserRound,
   Users,
-  Wallet,
 } from "lucide-react";
 import type { State, Command } from "../types";
 import { money } from "../api";
 
-const names = ["Omar Hassan", "Leena Thomas", "Alex Rivera"];
-const roles = ["Operations director", "Finance lead", "Field lead"];
 export function Recovery({
   state,
   command,
@@ -35,19 +32,8 @@ export function Recovery({
     <>
       <div className="page-heading">
         <div>
-          <p className="eyebrow">
-            <span />
-            AVAILABILITY IS NEVER GUARANTEED
-          </p>
-          <h1>Authority can recover.</h1>
-          <p className="subtitle">
-            A lost key should not mean a permanently frozen operation.
-          </p>
+          <h1>Access</h1>
         </div>
-        <span className="badge subtle">
-          <Wallet size={14} />
-          LOCAL WALLET SIMULATOR
-        </span>
       </div>
       <section className="availability-banner">
         <Clock3 size={25} />
@@ -59,51 +45,37 @@ export function Recovery({
             · {state.supervision.silence_hours}h since primary action
           </strong>
           <p>
-            After 4 hours, pending decisions can route to Omar. After 7 days,
+            After 4 hours, pending decisions can route to the backup approver. After 7 days,
             guardian recovery becomes eligible. Agent activity never refreshes
-            this clock. Local role actions simulate signatures.
+            this clock. Each recorded approval is tied to a distinct authorizer.
           </p>
         </div>
-        <button
-          className="button secondary"
-          disabled={busy}
-          onClick={() => command("/demo/clock", { hours: 4 })}
-        >
-          Advance 4h
-        </button>
-        <button
-          className="button secondary"
-          disabled={busy}
-          onClick={() => command("/demo/clock", { hours: 168 })}
-        >
-          Advance 7 days
-        </button>
       </section>
       <div className="wallet-summary">
         <span className="wallet-summary-icon">
           <KeyRound size={29} />
         </span>
         <div>
-          <span className="eyebrow small">SITE OPERATING WALLET</span>
+          <span className="eyebrow small">PAYMENT ACCOUNT</span>
           <h2>
-            {money(state.wallet.balance_cents)} <small>USDC equivalent</small>
+            {money(state.wallet.balance_cents)} <small>Available balance</small>
           </h2>
           <p>
-            Limited funds. Limited authority. Recovery changes the supervisor.
+            Spending limits stay in place during access recovery.
           </p>
         </div>
         <div className="current-owner">
-          <span>CURRENT AUTHORITY</span>
+          <span>ACCOUNT OWNER</span>
           <strong>
             <UserRound size={16} />
             {state.wallet.owner === "supervisor"
-              ? "Maya Kapoor"
-              : "Leena Thomas"}
+              ? "Primary supervisor"
+              : "Replacement supervisor"}
           </strong>
           <small>
             {state.wallet.owner === "supervisor"
-              ? "Original supervisor"
-              : "Recovered supervisor"}
+              ? "Primary supervisor"
+              : "Replacement supervisor"}
           </small>
         </div>
       </div>
@@ -120,7 +92,7 @@ export function Recovery({
               {recovery.stage === "idle"
                 ? "NORMAL OPERATION"
                 : recovery.stage === "complete"
-                  ? "AUTHORITY RECOVERED"
+                  ? "ACCESS RESTORED"
                   : recovery.stage === "voting"
                     ? "GUARDIAN VOTING"
                     : ready
@@ -152,15 +124,15 @@ export function Recovery({
             <p>
               {recovery.stage === "idle"
                 ? state.supervision.recovery_eligible
-                  ? "Seven days without primary-supervisor actions have made recovery eligible."
-                  : "Backup approvals open after 4 hours. Guardian recovery opens after 7 days of primary-owner silence."
+                  ? "Seven days without primary-supervisor activity have made recovery eligible."
+                  : "Backup approval opens after 4 hours. Guardian recovery opens after 7 days without primary-supervisor activity."
                 : recovery.stage === "voting"
-                  ? "Two distinct designated guardians must approve Leena as the new supervisor."
+                  ? "Two distinct designated guardians must approve the new supervisor."
                   : recovery.stage === "complete"
-                    ? "Leena now holds supervisor authority. Funds remained in the operating wallet."
+                    ? "The new supervisor now has access. Funds remain in the account."
                     : ready
-                      ? "Finalize explicitly to transfer authority to Leena."
-                      : "The current owner can cancel. The simulation clock can advance without waiting two real days."}
+                      ? "Finalize to transfer access to the replacement supervisor."
+                      : "The current owner can cancel during the waiting period."}
             </p>
             {recovery.stage === "timelock" && (
               <div className="timelock-box">
@@ -170,9 +142,6 @@ export function Recovery({
                 <div className="timelock-track">
                   <span style={{ width: ready ? "100%" : "3%" }} />
                 </div>
-                <small>
-                  Simulation time: {new Date(recovery.now).toLocaleString()}
-                </small>
               </div>
             )}
           </div>
@@ -180,15 +149,9 @@ export function Recovery({
             {recovery.guardians.map((id, index) => (
               <div className="guardian-row" key={id}>
                 <span className={`avatar avatar-${index}`}>
-                  {names[index]
-                    .split(" ")
-                    .map((n) => n[0])
-                    .join("")}
+                  {index + 1}
                 </span>
-                <div>
-                  <strong>{names[index]}</strong>
-                  <small>{roles[index]}</small>
-                </div>
+                <div><strong>Guardian {index + 1}</strong></div>
                 <button
                   className={`button ${recovery.approvals.includes(id) ? "approved-button" : "secondary"}`}
                   disabled={
@@ -204,7 +167,7 @@ export function Recovery({
                       Approved
                     </>
                   ) : (
-                    "Simulate approval"
+                    "Approve"
                   )}
                 </button>
               </div>
@@ -217,7 +180,7 @@ export function Recovery({
                 disabled={busy || !state.supervision.recovery_eligible}
                 onClick={() => operate("start")}
               >
-                Start eligible recovery <ChevronRight size={17} />
+                Start recovery <ChevronRight size={17} />
               </button>
             )}
             {(recovery.stage === "voting" || recovery.stage === "timelock") && (
@@ -232,19 +195,19 @@ export function Recovery({
             {recovery.stage === "timelock" && (
               <button
                 className="button primary"
-                disabled={busy}
-                onClick={() => operate(ready ? "finalize" : "advance")}
+                disabled={busy || !ready}
+                onClick={() => operate("finalize")}
               >
                 {ready
-                  ? "Finalize authority transfer"
-                  : "Advance 48h · demo only"}
+                  ? "Transfer access"
+                  : "48-hour waiting period"}
                 <ChevronRight size={17} />
               </button>
             )}
           </div>
           <div className="panel-caption">
             <ShieldCheck size={14} />
-            Missed check-ins never automatically transfer authority or funds.
+            Recovery requires guardian approval and a waiting period.
           </div>
         </section>
         <aside className="panel recovery-path">
@@ -269,7 +232,7 @@ export function Recovery({
                 text: "48 hours for the original owner to intervene.",
               },
               {
-                title: "Authority transferred",
+                title: "Access transferred",
                 text: "A new supervisor can authorize operations.",
               },
             ].map((item, index) => (
@@ -286,11 +249,7 @@ export function Recovery({
           </ol>
           <div className="recovery-contract-note">
             <span className="eyebrow small">ALSO IN THIS REPOSITORY</span>
-            <p>
-              A Solidity wallet with guardian quorum, timelock, spending limits,
-              and local EVM tests. This screen currently uses the Python
-              simulator.
-            </p>
+            <p>Guardian approval and a waiting period protect access changes.</p>
           </div>
         </aside>
       </div>

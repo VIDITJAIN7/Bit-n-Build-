@@ -61,12 +61,23 @@ export type FieldTask = {
   subject_code: string;
   subject_label: string;
   question: string;
+  instructions?: string;
+  assignee?: string;
+  priority?: "low" | "normal" | "high" | "urgent";
+  report_fields: ReportFieldDefinition[];
   gates_decision: boolean;
   status: "open" | "answered" | "cancelled";
   created_at: string;
   answer: boolean | null;
   answered_at: string | null;
   report_id: string | null;
+};
+export type ReportFieldType = "text" | "number" | "yes_no";
+export type ReportFieldDefinition = {
+  key: string;
+  label: string;
+  type: ReportFieldType;
+  required: boolean;
 };
 export type Attachment = {
   kind: "photo" | "audio";
@@ -91,6 +102,7 @@ export type FieldReport = {
   created_at: string;
   asset_code: string;
   checklist: Checklist;
+  responses?: Record<string, string | number | boolean>;
   attachments: Attachment[];
 };
 export type ServerReport = Omit<FieldReport, "attachments"> & {
@@ -103,6 +115,7 @@ export type LocalReport = FieldReport & {
   error?: string;
   subject_label?: string;
   question?: string;
+  field_labels?: Record<string, string>;
 };
 export type AuditEvent = {
   id: string;
@@ -169,6 +182,8 @@ export type TriggerAction = {
   supplier_id: string | null;
   amount_cents: number | null;
   requires_field_check: boolean;
+  report_fields: ReportFieldDefinition[];
+  assignee: string;
 };
 export type TriggerDraft = {
   name: string;
@@ -233,6 +248,7 @@ export type State = {
     last_cycle_at: string | null;
     last_cycle_changes: number;
     interval_seconds: number;
+    planner: "rules" | "ai-risk";
   };
   wallet: {
     balance_cents: number;

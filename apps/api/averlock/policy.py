@@ -49,7 +49,9 @@ def evaluate(state, action):
             reasons.append("Exceeds the remaining autonomous daily budget")
         typical = policy.get("typical_purchase_cents")
         if typical and amount >= 3 * typical:
-            reasons.append(f"Purchase is {amount / typical:.1f}× larger than typical site purchases")
+            reasons.append(
+                f"Purchase is {amount / typical:.1f}× larger than typical site purchases"
+            )
         if amount > policy["supervisor_limit_cents"]:
             limit = money(policy["supervisor_limit_cents"])
             hard_blocks.append(f"Above the operating wallet's {limit} transaction limit")
@@ -58,9 +60,19 @@ def evaluate(state, action):
     if action.get("requires_field_check"):
         reasons.append("Physical confirmation required")
     score = min(100, 8 + len(reasons) * 16 + len(hard_blocks) * 45)
+    ai_risk = action.get("ai_risk") or {}
+    ai_score = ai_risk.get("score", 0)
+    if isinstance(ai_score, bool) or not isinstance(ai_score, int) or not 0 <= ai_score <= 100:
+        ai_score = 100
+        ai_risk = {**ai_risk, "flags": [*ai_risk.get("flags", []), "Invalid AI risk assessment"]}
+    ai_flags = ai_risk.get("flags", [])
+    if ai_risk and (not ai_risk.get("available", True) or ai_flags or ai_score >= 35):
+        reasons.extend(ai_flags or ["AI risk assessment recommends human review"])
+    score = max(score, ai_score)
     level = (
         "high"
         if hard_blocks
+        or ai_score >= 70
         or len(reasons) > 2
         or "New payment destination" in reasons
         or action.get("is_canary")
@@ -69,7 +81,12 @@ def evaluate(state, action):
         else "low"
     )
     return {
-        "auto_allowed": not reasons and not hard_blocks and not action.get("is_canary"),
+        "auto_allowed": (
+            not reasons
+            and not hard_blocks
+            and not action.get("is_canary")
+            and (not ai_risk or (ai_risk.get("available", True) and ai_score < 35 and not ai_flags))
+        ),
         "level": level,
         "score": score,
         "reasons": hard_blocks + reasons,

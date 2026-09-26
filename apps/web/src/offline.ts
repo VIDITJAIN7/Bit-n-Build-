@@ -12,7 +12,7 @@ export async function listReports(): Promise<LocalReport[]> {
 }
 export async function enqueue(
   report: FieldReport,
-  context: Pick<LocalReport, "subject_label" | "question">,
+  context: Pick<LocalReport, "subject_label" | "question" | "field_labels">,
 ) {
   // Resolve only after IndexedDB commits, before displaying SAVED.
   await update<LocalReport[]>(REPORTS, (reports) => [
@@ -37,6 +37,7 @@ export function syncReports(): Promise<void> {
         created_at: local.created_at,
         asset_code: local.asset_code,
         checklist: local.checklist,
+        responses: local.responses,
         attachments: local.attachments,
       };
       try {

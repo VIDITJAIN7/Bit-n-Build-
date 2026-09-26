@@ -6,7 +6,7 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
 
-from .seed import SCHEMA_VERSION, initial_state
+from .seed import SCHEMA_VERSION, initial_state, migrate_state
 
 
 class Repository(Protocol):
@@ -32,10 +32,40 @@ class SQLiteRepository:
                 "kind TEXT NOT NULL, data_url TEXT NOT NULL)"
             )
             row = db.execute("SELECT payload FROM state WHERE id=1").fetchone()
-            if row is None or json.loads(row[0]).get("schema_version") != SCHEMA_VERSION:
+            if row is None:
                 db.execute(
                     "INSERT OR REPLACE INTO state VALUES (1, ?)", (json.dumps(initial_state()),)
                 )
+            else:
+                state = json.loads(row[0])
+                required_sections = {
+                    "schema_version",
+                    "workspace",
+                    "sites",
+                    "assets",
+                    "inventory",
+                    "suppliers",
+                    "triggers",
+                    "policy",
+                    "wallet",
+                    "agent",
+                    "actions",
+                    "field_tasks",
+                    "reports",
+                    "audit",
+                    "counters",
+                    "stats",
+                    "supervision",
+                    "drills",
+                    "weather",
+                    "recovery",
+                }
+                if not required_sections.issubset(state):
+                    state = initial_state()
+                    db.execute("UPDATE state SET payload=? WHERE id=1", (json.dumps(state),))
+                elif state.get("schema_version", 0) < SCHEMA_VERSION:
+                    state = migrate_state(state)
+                    db.execute("UPDATE state SET payload=? WHERE id=1", (json.dumps(state),))
 
     @contextmanager
     def transaction(self):

@@ -10,6 +10,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+!deploy/vercel-supabase/.env.production.example
 artifacts/
 coverage/
 *.log

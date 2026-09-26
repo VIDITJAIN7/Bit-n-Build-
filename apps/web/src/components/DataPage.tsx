@@ -106,7 +106,7 @@ export function DataPage({
   const patch = (collection: Tab, id: string, body: object) =>
     command(`/data/${collection}/${id}`, body, "PATCH");
   const remove = (collection: Tab, id: string, label: string) => {
-    if (window.confirm(`Delete ${label}? Triggers stop seeing it immediately.`))
+    if (window.confirm(`Delete ${label}? Tasks will no longer use it.`))
       void command(`/data/${collection}/${id}`, {}, "DELETE");
   };
   const set = (key: string, value: string) =>
@@ -204,15 +204,7 @@ export function DataPage({
     <>
       <div className="page-heading">
         <div>
-          <p className="eyebrow">
-            <span /> OPERATOR DATA
-          </p>
-          <h1>The data your agent works from.</h1>
-          <p className="subtitle">
-            Change a reading, a stock level, or a supplier record. Triggers
-            re-evaluate on the agent’s next cycle, every{" "}
-            {state.agent.interval_seconds || 5} seconds.
-          </p>
+          <h1>Data</h1>
         </div>
         <button className="button primary" onClick={() => setAdding(!adding)}>
           {adding ? <X size={16} /> : <Plus size={16} />}
@@ -298,7 +290,7 @@ export function DataPage({
               {input("name", "Site name", "North Depot")}
               {input("industry", "Industry", "Fleet depot")}
               {input("location", "Location", "Sharjah, UAE", false)}
-              {input("technician", "Technician", "Rami Aziz", false)}
+              {input("technician", "Assigned worker", "Worker name", false)}
               {input("next_visit_days", "Next visit (days)", "4", false)}
             </>
           )}
@@ -307,7 +299,6 @@ export function DataPage({
               <Plus size={15} />
               Add to workspace
             </button>
-            <small>New records are visible to every trigger immediately.</small>
           </div>
         </form>
       )}
@@ -746,8 +737,7 @@ export function DataPage({
           </div>
         )}
         <div className="panel-caption">
-          <Database size={14} /> Stored in the local SQLite workspace. Every
-          change is recorded in the activity log.
+          <Database size={14} /> Changes appear in Activity.
         </div>
       </section>
     </>

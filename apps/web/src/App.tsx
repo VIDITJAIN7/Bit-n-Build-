@@ -1,27 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
-  ArrowUpRight,
-  CircleHelp,
   ClipboardCheck,
   Database,
-  FlaskConical,
   LayoutGrid,
   LoaderCircle,
+  LogOut,
   MapPin,
   Menu,
   Radio,
-  RotateCcw,
   ShieldCheck,
   Workflow,
   WifiOff,
   X,
 } from "lucide-react";
-import { ago, getState, sendCommand } from "./api";
+import { getState, request, sendCommand } from "./api";
 import {
   cachedState,
   cacheState,
-  clearLocalData,
   enqueue,
   listReports,
   syncReports,
@@ -42,23 +38,54 @@ import { Review } from "./components/Review";
 import { Field } from "./components/Field";
 import { Recovery } from "./components/Recovery";
 import { Audit } from "./components/Audit";
+import { SitePicker } from "./components/SitePicker";
 
 const pages = [
-  { id: "control", label: "Control panel", icon: LayoutGrid },
-  { id: "builder", label: "Triggers", icon: Workflow },
+  { id: "control", label: "Overview", icon: LayoutGrid },
+  { id: "builder", label: "Tasks", icon: Workflow },
   { id: "data", label: "Data", icon: Database },
-  { id: "review", label: "Review queue", icon: ClipboardCheck },
-  { id: "field", label: "Field console", icon: MapPin },
-  { id: "recovery", label: "Authority & recovery", icon: ShieldCheck },
-  { id: "audit", label: "Activity log", icon: Activity },
+  { id: "review", label: "Review", icon: ClipboardCheck },
+  { id: "field", label: "Field", icon: MapPin },
+  { id: "recovery", label: "Access", icon: ShieldCheck },
+  { id: "audit", label: "Activity", icon: Activity },
 ] as const;
 const POLL_MS = 4000;
+const ROLE_KEY = "workkite-role";
+const EMAIL_KEY = "workkite-email";
+
+function readSavedRole(): "admin" | "worker" | null {
+  const saved = localStorage.getItem(ROLE_KEY) ?? sessionStorage.getItem(ROLE_KEY);
+  if (saved === "admin" || saved === "worker") {
+    if (!localStorage.getItem(ROLE_KEY)) localStorage.setItem(ROLE_KEY, saved);
+    if (!localStorage.getItem(EMAIL_KEY)) {
+      const email = sessionStorage.getItem(EMAIL_KEY);
+      if (email) localStorage.setItem(EMAIL_KEY, email);
+    }
+  }
+  sessionStorage.removeItem(ROLE_KEY);
+  sessionStorage.removeItem(EMAIL_KEY);
+  return saved === "admin" || saved === "worker" ? saved : null;
+}
 
 export type BuilderTarget = { triggerId?: string; draft?: TriggerDraft };
 
 export default function App() {
   const [state, setState] = useState<State | null>(null);
-  const [page, setPage] = useState<Page>("control");
+  const [role, setRole] = useState<"admin" | "worker">(
+    () => readSavedRole() ?? "admin",
+  );
+  const [session, setSession] = useState(
+    () => localStorage.getItem(ROLE_KEY) !== null,
+  );
+  const [accountEmail, setAccountEmail] = useState(
+    () => localStorage.getItem(EMAIL_KEY) ?? "",
+  );
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [page, setPage] = useState<Page>(() =>
+    localStorage.getItem(ROLE_KEY) === "worker" ? "field" : "control",
+  );
   const [siteFilter, setSiteFilter] = useState("all");
   const [builder, setBuilder] = useState<BuilderTarget & { nonce: number }>({
     nonce: 0,
@@ -67,17 +94,36 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [connected, setConnected] = useState(navigator.onLine);
-  const [simulatedOffline, setSimulatedOffline] = useState(false);
   const [error, setError] = useState("");
   const [notification, setNotification] = useState("");
   const [sidebar, setSidebar] = useState(false);
-  const [help, setHelp] = useState(false);
   const [now, setNow] = useState(Date.now());
   const commandLock = useRef(false);
   const refreshing = useRef(false);
   const stamp = useRef(0);
-  const offline = !connected || simulatedOffline;
+  const offline = !connected;
   const notify = useCallback((message: string) => setNotification(message), []);
+  useEffect(() => {
+    const syncAcrossTabs = () => {
+      const savedRole = localStorage.getItem(ROLE_KEY);
+      const validRole = savedRole === "admin" || savedRole === "worker";
+      setRole(validRole ? savedRole : "admin");
+      setSession(validRole);
+      setAccountEmail(validRole ? localStorage.getItem(EMAIL_KEY) ?? "" : "");
+    };
+    window.addEventListener("storage", syncAcrossTabs);
+    return () => window.removeEventListener("storage", syncAcrossTabs);
+  }, []);
+  useEffect(() => {
+    const expected = !session
+      ? "/login"
+      : role === "worker"
+        ? "/worker"
+        : "/admin";
+    if (window.location.pathname !== expected)
+      window.history.replaceState({}, "", expected);
+    if (session) setPage(role === "worker" ? "field" : "control");
+  }, [role, session]);
   const refresh = useCallback(async () => {
     if (refreshing.current) return;
     refreshing.current = true;
@@ -190,7 +236,7 @@ export default function App() {
   }
   async function saveReport(
     report: FieldReport,
-    context: Pick<LocalReport, "subject_label" | "question">,
+    context: Pick<LocalReport, "subject_label" | "question" | "field_labels">,
   ) {
     try {
       await enqueue(report, context);
@@ -210,24 +256,47 @@ export default function App() {
     setSidebar(false);
     window.scrollTo({ top: 0, behavior: "instant" });
   }
+  async function signIn() {
+    setLoginError("");
+    try {
+      const account = await request<{
+        email: string;
+        role: "admin" | "worker";
+      }>("/auth/login", { email: loginEmail, password: loginPassword });
+      const next = account.role;
+      localStorage.setItem(ROLE_KEY, next);
+      localStorage.setItem(EMAIL_KEY, account.email);
+      setRole(next);
+      setSession(true);
+      setAccountEmail(account.email);
+      setPage(next === "worker" ? "field" : "control");
+      window.history.replaceState(
+        {},
+        "",
+        next === "worker" ? "/worker" : "/admin",
+      );
+    } catch (error) {
+      setLoginError(
+        error instanceof Error ? error.message : "Sign-in could not complete.",
+      );
+    }
+  }
+  function signOut() {
+    localStorage.removeItem(ROLE_KEY);
+    localStorage.removeItem(EMAIL_KEY);
+    sessionStorage.removeItem(ROLE_KEY);
+    sessionStorage.removeItem(EMAIL_KEY);
+    setLoginEmail("");
+    setLoginPassword("");
+    setLoginError("");
+    setSession(false);
+    setAccountEmail("");
+    window.history.replaceState({}, "", "/login");
+  }
+  const workerMode = role === "worker";
   function openBuilder(target: BuilderTarget = {}) {
     setBuilder((old) => ({ ...target, nonce: old.nonce + 1 }));
     go("builder");
-  }
-  async function reset() {
-    if (
-      !window.confirm(
-        "Reset the local demo? This restores the sample workspace and triggers, and clears actions, audit history, recovery, and this browser’s saved field reports.",
-      )
-    )
-      return;
-    if (await command("/demo/reset")) {
-      await clearLocalData();
-      setReports([]);
-      setSiteFilter("all");
-      await refresh();
-      go("control");
-    }
   }
   const pending =
     state?.actions.filter((a) => a.status === "pending").length || 0;
@@ -235,36 +304,75 @@ export default function App() {
     state?.field_tasks.filter((t) => t.status === "open").length || 0;
   const site = state?.sites.find((s) => s.id === siteFilter);
   const SiteIcon = site ? industryIcon(site.industry) : Radio;
-  const agent = state?.agent;
+  if (!session) {
+    return (
+      <div className="login-page">
+        <div className="login-brand">
+          <span>Workkite</span>
+        </div>
+        <form
+          className="login-card"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void signIn();
+          }}
+        >
+          <h1>Sign in</h1>
+          <label>
+            Work email
+            <input
+              type="email"
+              autoComplete="username"
+              value={loginEmail}
+              onChange={(event) => setLoginEmail(event.target.value)}
+              placeholder="you@company.com"
+              required
+            />
+          </label>
+          <label>
+            Password
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={loginPassword}
+              onChange={(event) => setLoginPassword(event.target.value)}
+              required
+            />
+          </label>
+          {loginError && (
+            <p className="login-error" role="alert">
+              {loginError}
+            </p>
+          )}
+          <button className="button primary login-action" type="submit">
+            Sign in
+          </button>
+        </form>
+      </div>
+    );
+  }
   return (
-    <div className="app">
+    <div className={`app ${workerMode ? "worker-app" : ""}`}>
       <a className="skip-link" href="#main">
         Skip to content
       </a>
-      <aside className={`sidebar ${sidebar ? "sidebar-open" : ""}`}>
+      <aside
+        className={`sidebar ${sidebar ? "sidebar-open" : ""}`}
+        hidden={workerMode}
+      >
         <button
           className="brand"
           onClick={() => go("control")}
-          aria-label="Averlock home"
+          aria-label="Workkite home"
         >
-          <span className="brand-mark">
-            <svg viewBox="0 0 32 32">
-              <path d="m16 4 12 25h-7l-5-11-5 11H4L16 4Z" fill="currentColor" />
-            </svg>
-          </span>
-          <span>
-            averlock<span className="brand-period">.</span>
-          </span>
+          <span>Workkite</span>
         </button>
-        <div className="workspace-label">
-          {state?.workspace.name.toUpperCase() ?? "YOUR WORKSPACE"}
-        </div>
         <label className="workspace-card site-switcher">
           <span className="workspace-icon">
             <SiteIcon size={18} />
           </span>
           <span className="site-switcher-text">
-            <small>{site ? site.industry : "Viewing"}</small>
+            <small>{site ? site.industry : "Site"}</small>
             <select
               value={siteFilter}
               onChange={(e) => setSiteFilter(e.target.value)}
@@ -301,35 +409,24 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <div className="autonomy-status">
-            <span
-              className={`status-dot ${agent && !agent.enabled ? "paused-dot" : ""}`}
-            />
-            <div>
-              <strong>
-                {agent?.enabled === false
-                  ? "Agent paused"
-                  : "Agent working in the background"}
-              </strong>
-              <small>Policy enforced on every action</small>
-            </div>
-          </div>
-          <button className="sidebar-help" onClick={() => setHelp(!help)}>
-            <CircleHelp size={16} />
-            Demo guide
-            <ArrowUpRight size={14} />
-          </button>
           <div className="profile">
-            <span className="avatar">MK</span>
+            <span className="avatar">{role === "admin" ? "AD" : "WK"}</span>
             <div>
               <strong>
-                {state?.wallet.owner === "replacement-supervisor"
-                  ? "Leena Thomas"
-                  : "Maya Kapoor"}
+                {accountEmail || "Signed-in user"}
               </strong>
-              <small>Supervisor · demo role</small>
+              <small>
+                {role === "admin" ? "Administrator" : "Field worker"}
+              </small>
             </div>
             <span className="profile-dot" />
+            <button
+              className="icon-button"
+              onClick={signOut}
+              aria-label="Sign out"
+            >
+              <LogOut size={16} />
+            </button>
           </div>
         </div>
       </aside>
@@ -341,95 +438,76 @@ export default function App() {
         />
       )}
       <div className="main-shell">
-        <header className="topbar">
-          <button
-            className="icon-button mobile-menu"
-            onClick={() => setSidebar(!sidebar)}
-            aria-label="Open navigation"
-          >
-            <Menu size={20} />
-          </button>
-          <div className="breadcrumbs">
-            <span>Workspace</span>
-            <span>/</span>
-            <span>{site ? site.name : "All sites"}</span>
-            <span>/</span>
-            <strong>{pages.find((p) => p.id === page)?.label}</strong>
-          </div>
-          <div className="topbar-right">
-            {agent && (
+        <header className={`topbar ${workerMode ? "worker-topbar" : ""}`}>
+          {workerMode ? (
+            <>
+              <div className="worker-topbar-brand">
+                <strong>Tasks</strong>
+              </div>
+              <div className="worker-site-select">
+                <span>Site</span>
+                <SitePicker
+                  sites={state?.sites ?? []}
+                  value={siteFilter}
+                  onChange={setSiteFilter}
+                />
+              </div>
+              <div className="topbar-right">
+                <span className="connection">
+                  {offline ? (
+                    <WifiOff size={14} />
+                  ) : (
+                    <span className="status-dot" />
+                  )}
+                  {offline ? "Offline" : "Online"}
+                </span>
+                <button
+                  className="icon-button"
+                  onClick={signOut}
+                  aria-label="Sign out"
+                >
+                  <LogOut size={17} />
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
               <button
-                className={`agent-pill ${agent.enabled ? "" : "paused"}`}
-                onClick={() => go("control")}
-                title="Background agent status"
+                className="icon-button mobile-menu"
+                onClick={() => setSidebar(!sidebar)}
+                aria-label="Open navigation"
               >
-                <span className="status-dot" />
-                {agent.enabled
-                  ? `Agent · ${ago(agent.last_cycle_at, now)}`
-                  : "Agent paused"}
+                <Menu size={20} />
               </button>
-            )}
-            <span className="demo-pill">
-              <FlaskConical size={13} />
-              LOCAL DEMO
-            </span>
-            <span className="connection">
-              {offline ? (
-                <WifiOff size={14} />
-              ) : (
-                <span className="status-dot" />
-              )}
-              {simulatedOffline
-                ? "Offline simulation"
-                : connected
-                  ? "Online"
-                  : "Offline"}
-            </span>
-            <button
-              className="icon-button"
-              onClick={() => void reset()}
-              disabled={busy || offline}
-              aria-label="Reset local demo"
-              title="Reset local demo"
-            >
-              <RotateCcw size={17} />
-            </button>
-          </div>
+              <div className="breadcrumbs">
+                <strong>{site ? site.name : "All sites"}</strong>
+              </div>
+              <div className="topbar-right">
+                <span className="connection">
+                  {offline ? (
+                    <WifiOff size={14} />
+                  ) : (
+                    <span className="status-dot" />
+                  )}
+                  {connected ? "Online" : "Offline"}
+                </span>
+                <button
+                  className="icon-button"
+                  onClick={signOut}
+                  aria-label="Sign out"
+                >
+                  <LogOut size={17} />
+                </button>
+              </div>
+            </>
+          )}
         </header>
-        {help && (
-          <div className="demo-guide">
-            <div>
-              <strong>A five-minute walkthrough</strong>
-              <p>
-                Watch the control panel: the background agent evaluates every
-                trigger against your data and handles routine work. Edit a
-                reading in Data (for example, raise INV-07 above 70 °C) and see
-                its trigger fire. Build your own trigger, request a field check
-                on the replacement in Review, save the report offline, sync, and
-                approve. Advance the availability clock in Recovery to show
-                backup routing and guardian recovery.
-              </p>
-              <small>
-                All identities and wallet payments in this UI are simulated. No
-                external service is connected.
-              </small>
-            </div>
-            <button
-              className="icon-button"
-              onClick={() => setHelp(false)}
-              aria-label="Close demo guide"
-            >
-              <X size={18} />
-            </button>
-          </div>
-        )}
         {(offline || error) && state && (
           <div className="offline-banner">
             <WifiOff size={16} />
             <span>
-              {simulatedOffline
-                ? "Offline simulation is on. Reports stay on this device until you reconnect."
-                : "Showing the last available snapshot. Saved field reports are retained."}
+              Showing the last available snapshot. Saved field reports are
+              retained.
               {error && !offline ? ` ${error}` : ""}
             </span>
             {!offline && (
@@ -441,92 +519,95 @@ export default function App() {
           {loading && !state ? (
             <div className="empty loading">
               <LoaderCircle className="spin" size={28} />
-              <h2>Connecting to the local workspace…</h2>
+              <h2>Connecting to your workspace…</h2>
             </div>
           ) : !state ? (
             <div className="panel empty">
               <Radio size={35} />
-              <h1>Start the local services.</h1>
+              <h1>Workspace unavailable.</h1>
               <p>{error || "The operations API is not running."}</p>
-              <code>npm run dev</code>
               <button className="button primary" onClick={() => void refresh()}>
                 Try again
               </button>
             </div>
           ) : (
             <>
-              {page === "control" && (
-                <ControlPanel
-                  state={state}
-                  siteFilter={siteFilter}
-                  setSiteFilter={setSiteFilter}
-                  go={go}
-                  openBuilder={openBuilder}
-                  command={command}
-                  busy={busy || offline}
-                  now={now}
-                />
-              )}
-              {page === "builder" && (
-                <TriggerBuilder
-                  key={`${builder.triggerId ?? "new"}-${builder.nonce}`}
-                  state={state}
-                  target={builder}
-                  openBuilder={openBuilder}
-                  command={command}
-                  busy={busy || offline}
-                  go={go}
-                />
-              )}
-              {page === "data" && (
-                <DataPage
-                  state={state}
-                  siteFilter={siteFilter}
-                  command={command}
-                  busy={busy || offline}
-                />
-              )}
-              {page === "review" && (
-                <Review
-                  state={state}
-                  siteFilter={siteFilter}
-                  go={go}
-                  command={command}
-                  busy={busy || offline}
-                />
-              )}
-              {page === "field" && (
+              {workerMode ? (
                 <Field
                   state={state}
                   siteFilter={siteFilter}
                   reports={reports}
                   offline={offline}
-                  simulatedOffline={simulatedOffline}
-                  setSimulatedOffline={setSimulatedOffline}
                   onSave={saveReport}
                   onSync={synchronize}
                   busy={busy}
-                  command={command}
+                  workerMode
                 />
+              ) : (
+                <>
+                  {page === "control" && (
+                    <ControlPanel
+                      state={state}
+                      siteFilter={siteFilter}
+                      go={go}
+                      openBuilder={openBuilder}
+                      command={command}
+                      busy={busy || offline}
+                      now={now}
+                    />
+                  )}
+                  {page === "builder" && (
+                    <TriggerBuilder
+                      key={`${builder.triggerId ?? "new"}-${builder.nonce}`}
+                      state={state}
+                      target={builder}
+                      openBuilder={openBuilder}
+                      command={command}
+                      busy={busy || offline}
+                      go={go}
+                    />
+                  )}
+                  {page === "data" && (
+                    <DataPage
+                      state={state}
+                      siteFilter={siteFilter}
+                      command={command}
+                      busy={busy || offline}
+                    />
+                  )}
+                  {page === "review" && (
+                    <Review
+                      state={state}
+                      siteFilter={siteFilter}
+                      go={go}
+                      command={command}
+                      busy={busy || offline}
+                    />
+                  )}
+                  {page === "field" && (
+                    <Field
+                      state={state}
+                      siteFilter={siteFilter}
+                      reports={reports}
+                      offline={offline}
+                      onSave={saveReport}
+                      onSync={synchronize}
+                      busy={busy}
+                    />
+                  )}
+                  {page === "recovery" && (
+                    <Recovery
+                      state={state}
+                      command={command}
+                      busy={busy || offline}
+                    />
+                  )}
+                  {page === "audit" && <Audit state={state} />}
+                </>
               )}
-              {page === "recovery" && (
-                <Recovery
-                  state={state}
-                  command={command}
-                  busy={busy || offline}
-                />
-              )}
-              {page === "audit" && <Audit state={state} />}
             </>
           )}
         </main>
-        <footer className="app-footer">
-          <span>
-            <ShieldCheck size={13} />
-            Autonomy without losing human control.
-          </span>
-          <span>AVERLOCK / OPERATIONS CONTROL PLANE</span>
-        </footer>
       </div>
       {notification && (
         <div className="toast" role="status" aria-live="polite">

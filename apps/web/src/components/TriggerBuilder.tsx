@@ -16,7 +16,6 @@ import {
   ACTIONS,
   OPS,
   SOURCES,
-  TEMPLATES,
   blankDraft,
   draftOf,
   emptyAction,
@@ -28,6 +27,8 @@ import type {
   Condition,
   Page,
   Preview,
+  ReportFieldDefinition,
+  ReportFieldType,
   SchemaField,
   Source,
   State,
@@ -59,12 +60,22 @@ function payload(draft: TriggerDraft, fields: SchemaField[]): TriggerDraft {
 
 function problems(draft: TriggerDraft) {
   const list: string[] = [];
-  if (draft.name.trim().length < 3) list.push("Give the trigger a name.");
+  if (draft.name.trim().length < 3) list.push("Give the task a name.");
   if (draft.mode === "auto" && !draft.conditions.length)
-    list.push("Automatic triggers need at least one condition.");
+    list.push("Automatic tasks need at least one condition.");
   if (draft.conditions.some((c) => String(c.value).trim() === ""))
     list.push("Every condition needs a value.");
   const action = draft.action;
+  if (
+    action.type === "field_check" ||
+    (action.type === "purchase" && action.requires_field_check)
+  ) {
+    const keys = action.report_fields.map((field) => field.key);
+    if (new Set(keys).size !== keys.length)
+      list.push("Worker report fields need unique keys.");
+    if (action.report_fields.some((field) => !field.label.trim()))
+      list.push("Give every worker report field a label.");
+  }
   if (action.type === "field_check" && !action.question.trim())
     list.push("Write the question for the technician.");
   if (action.type === "purchase") {
@@ -75,6 +86,133 @@ function problems(draft: TriggerDraft) {
       list.push("Write the confirmation question.");
   }
   return list;
+}
+
+function defaultReportFields(): ReportFieldDefinition[] {
+  return [
+    {
+      key: "observed_condition",
+      label: "Observed condition confirmed?",
+      type: "yes_no",
+      required: true,
+    },
+    {
+      key: "measurement",
+      label: "Measurement or reading",
+      type: "number",
+      required: false,
+    },
+    {
+      key: "technician_notes",
+      label: "Technician notes",
+      type: "text",
+      required: false,
+    },
+  ];
+}
+
+function WorkerFieldsEditor({
+  fields,
+  onChange,
+}: {
+  fields: ReportFieldDefinition[];
+  onChange: (fields: ReportFieldDefinition[]) => void;
+}) {
+  function addField() {
+    if (fields.length >= 12) return;
+    let index = fields.length + 1;
+    while (fields.some((field) => field.key === `worker_field_${index}`))
+      index += 1;
+    onChange([
+      ...fields,
+      {
+        key: `worker_field_${index}`,
+        label: "New worker field",
+        type: "text",
+        required: false,
+      },
+    ]);
+  }
+  function patchField(index: number, patch: Partial<ReportFieldDefinition>) {
+    onChange(
+      fields.map((field, i) => (i === index ? { ...field, ...patch } : field)),
+    );
+  }
+  return (
+    <div className="worker-fields-editor">
+      <div className="form-heading compact-heading">
+        <div>
+          <h3>Worker report fields</h3>
+          <p>
+            These fields appear on the worker’s task form and are checked again
+            by the server.
+          </p>
+        </div>
+        <button
+          className="button secondary"
+          type="button"
+          onClick={addField}
+          disabled={fields.length >= 12}
+        >
+          <Plus size={15} /> Add field
+        </button>
+      </div>
+      {fields.length === 0 ? (
+        <p className="hint">
+          No extra fields yet. Workers will still provide the standard answer,
+          safety checklist, photo, and optional note.
+        </p>
+      ) : (
+        fields.map((field, index) => (
+          <div className="worker-field-row" key={`${field.key}-${index}`}>
+            <label className="field grow">
+              <span>Prompt shown to worker</span>
+              <input
+                maxLength={40}
+                value={field.label}
+                onChange={(event) =>
+                  patchField(index, { label: event.target.value })
+                }
+              />
+            </label>
+            <label className="field">
+              <span>Response</span>
+              <select
+                value={field.type}
+                onChange={(event) =>
+                  patchField(index, {
+                    type: event.target.value as ReportFieldType,
+                  })
+                }
+              >
+                <option value="text">Short text</option>
+                <option value="number">Number / measurement</option>
+                <option value="yes_no">Yes / no</option>
+              </select>
+            </label>
+            <label className="checkbox-row worker-required">
+              <input
+                type="checkbox"
+                checked={field.required}
+                onChange={(event) =>
+                  patchField(index, { required: event.target.checked })
+                }
+              />
+              Required
+            </label>
+            <button
+              className="icon-button"
+              type="button"
+              aria-label={`Remove ${field.label}`}
+              onClick={() => onChange(fields.filter((_, i) => i !== index))}
+            >
+              <Trash2 size={16} />
+            </button>
+          </div>
+        ))
+      )}
+    </div>
+  );
 }
 
 export function TriggerBuilder({
@@ -166,7 +304,10 @@ export function TriggerBuilder({
         : type === "notify"
           ? { title: "{name} needs attention" }
           : type === "field_check"
-            ? { question: "Is the problem visible on {code}?" }
+            ? {
+                question: "Is the problem visible on {code}?",
+                report_fields: defaultReportFields(),
+              }
             : type === "purchase"
               ? {
                   title: "Replace {name}",
@@ -193,54 +334,26 @@ export function TriggerBuilder({
     <>
       <div className="page-heading">
         <div>
-          <p className="eyebrow">
-            <span /> TRIGGER BUILDER
-          </p>
           <h1>
-            {existing
-              ? `Edit “${existing.name}”`
-              : "When this happens, do that."}
+            {existing ? existing.name : "New task"}
           </h1>
-          <p className="subtitle">
-            Triggers read the data your operators keep in Averlock. The agent
-            evaluates them in the background; the policy gate still decides what
-            may run without a person.
-          </p>
         </div>
         <button className="button secondary" onClick={() => go("control")}>
           <ArrowLeft size={16} />
-          Control panel
+          Cancel
         </button>
       </div>
-      {!existing && (
-        <section className="template-grid" aria-label="Templates">
-          {TEMPLATES.map((item) => (
-            <button
-              key={item.id}
-              className="template-card"
-              onClick={() => setDraft(item.draft(state))}
-            >
-              <span className="badge subtle">{item.tag}</span>
-              <strong>{item.name}</strong>
-              <small>{item.description}</small>
-            </button>
-          ))}
-        </section>
-      )}
       <div className="builder-grid">
         <div className="builder-main">
           <section className="panel form-section">
             <div className="form-heading">
               <span className="step">1</span>
               <div>
-                <h2>Name and mode</h2>
-                <p>
-                  Manual triggers become runbook buttons on the control panel.
-                </p>
+                <h2>Details</h2>
               </div>
             </div>
             <label className="field">
-              <span>Trigger name</span>
+              <span>Name</span>
               <input
                 value={draft.name}
                 maxLength={80}
@@ -263,12 +376,12 @@ export function TriggerBuilder({
                   [
                     "auto",
                     "Automatic",
-                    "Background agent evaluates every cycle",
+                    "",
                   ],
                   [
                     "manual",
-                    "Manual runbook",
-                    "Runs only when someone presses it",
+                    "On demand",
+                    "",
                   ],
                 ] as const
               ).map(([value, label, hint]) => (
@@ -280,7 +393,7 @@ export function TriggerBuilder({
                   onClick={() => update({ mode: value })}
                 >
                   <strong>{label}</strong>
-                  <small>{hint}</small>
+                  {hint && <small>{hint}</small>}
                 </button>
               ))}
             </div>
@@ -290,7 +403,6 @@ export function TriggerBuilder({
               <span className="step">2</span>
               <div>
                 <h2>When</h2>
-                <p>Fields come from the records in your workspace.</p>
               </div>
             </div>
             <div className="form-row">
@@ -461,7 +573,7 @@ export function TriggerBuilder({
               </div>
               {draft.mode === "manual" && !draft.conditions.length && (
                 <p className="hint">
-                  No conditions: the runbook targets every{" "}
+                  No conditions: the task targets every{" "}
                   {SOURCES[draft.source].noun} in the chosen site.
                 </p>
               )}
@@ -471,11 +583,7 @@ export function TriggerBuilder({
             <div className="form-heading">
               <span className="step">3</span>
               <div>
-                <h2>Then</h2>
-                <p>
-                  Use {"{name}"}, {"{code}"} or {"{site}"} to insert details
-                  from the matched record.
-                </p>
+                <h2>Action</h2>
               </div>
             </div>
             <div className="action-cards" role="radiogroup" aria-label="Action">
@@ -500,7 +608,6 @@ export function TriggerBuilder({
                   >
                     <Icon size={18} />
                     <strong>{meta.label}</strong>
-                    <small>{meta.description}</small>
                   </button>
                 );
               })}
@@ -518,13 +625,37 @@ export function TriggerBuilder({
               </label>
             )}
             {action.type === "field_check" && (
-              <label className="field">
-                <span>Yes/no question for the technician</span>
-                <input
-                  value={action.question}
-                  maxLength={160}
-                  onChange={(e) => updateAction({ question: e.target.value })}
+              <>
+                <label className="field">
+                  <span>Task instructions for the worker</span>
+                  <input
+                    value={action.question}
+                    maxLength={160}
+                    onChange={(e) => updateAction({ question: e.target.value })}
+                  />
+                </label>
+                <WorkerFieldsEditor
+                  fields={action.report_fields}
+                  onChange={(report_fields) => updateAction({ report_fields })}
                 />
+              </>
+            )}
+            {(action.type === "work_order" ||
+              action.type === "field_check") && (
+              <label className="field">
+                <span>Assigned worker</span>
+                <input
+                  value={action.assignee}
+                  maxLength={80}
+                  placeholder="Use this site's assigned technician"
+                  onChange={(event) =>
+                    updateAction({ assignee: event.target.value })
+                  }
+                />
+                <small>
+                  The background agent creates and assigns a field task when
+                  this task matches.
+                </small>
               </label>
             )}
             {action.type === "purchase" && (
@@ -586,31 +717,36 @@ export function TriggerBuilder({
                           e.target.checked && !action.question
                             ? "Is the fault visible on {code}?"
                             : action.question,
+                        report_fields:
+                          e.target.checked && action.report_fields.length === 0
+                            ? defaultReportFields()
+                            : action.report_fields,
                       })
                     }
                   />
                   Require a technician’s on-site confirmation before approval
                 </label>
                 {action.requires_field_check && (
-                  <label className="field">
-                    <span>Confirmation question</span>
-                    <input
-                      value={action.question}
-                      maxLength={160}
-                      onChange={(e) =>
-                        updateAction({ question: e.target.value })
+                  <>
+                    <label className="field">
+                      <span>Task instructions for the worker</span>
+                      <input
+                        value={action.question}
+                        maxLength={160}
+                        onChange={(e) =>
+                          updateAction({ question: e.target.value })
+                        }
+                      />
+                    </label>
+                    <WorkerFieldsEditor
+                      fields={action.report_fields}
+                      onChange={(report_fields) =>
+                        updateAction({ report_fields })
                       }
                     />
-                  </label>
+                  </>
                 )}
               </>
-            )}
-            {action.type === "restock" && (
-              <p className="hint">
-                Quantity tops each item up to its reorder level. The planner
-                compares approved suppliers’ price and lead time against the
-                site’s next visit.
-              </p>
             )}
             <label className="field inline">
               <span>Re-fire at most every</span>
@@ -633,8 +769,7 @@ export function TriggerBuilder({
           <section className="panel preview-panel">
             <div className="panel-heading">
               <div>
-                <h2>Live preview</h2>
-                <p>Evaluated by the server against current data</p>
+                <h2>Matches</h2>
               </div>
               <Sparkles size={18} />
             </div>
@@ -666,13 +801,13 @@ export function TriggerBuilder({
               </>
             ) : (
               <p className="muted small-text">
-                Add a condition to see matches.
+                Add a condition.
               </p>
             )}
             <div className="preview-policy">
               <ShieldCheck size={15} />
               <p>
-                Whatever this trigger proposes still meets the policy gate: the
+                Any action from this rule must meet the workspace policy: the
                 agent may spend at most{" "}
                 {money(state.policy.agent_per_action_cents)} per action and{" "}
                 {money(state.policy.agent_daily_cents)} per day, only with
@@ -702,7 +837,7 @@ export function TriggerBuilder({
               onClick={() => void save()}
             >
               {existing ? <Save size={16} /> : <CirclePlay size={16} />}
-              {existing ? "Save changes" : "Create trigger"}
+              {existing ? "Save changes" : "Create task"}
             </button>
             {existing && (
               <button
@@ -711,13 +846,13 @@ export function TriggerBuilder({
                 onClick={() => void remove()}
               >
                 <Trash2 size={15} />
-                Delete trigger
+                Delete task
               </button>
             )}
           </section>
           <section className="panel existing-triggers">
             <div className="panel-heading">
-              <h2>All triggers</h2>
+              <h2>Tasks</h2>
             </div>
             {state.triggers.map((trigger) => (
               <button

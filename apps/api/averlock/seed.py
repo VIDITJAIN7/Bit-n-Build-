@@ -1,7 +1,8 @@
+from copy import deepcopy
 from datetime import datetime, timezone
 
-# Bump when the stored state shape changes; older local databases are re-seeded.
-SCHEMA_VERSION = 2
+# Bump when the stored state shape changes; supported local states are migrated in place.
+SCHEMA_VERSION = 4
 
 
 def now_iso():
@@ -19,7 +20,15 @@ def blank_runtime():
     }
 
 
-def action(kind, title="", question="", supplier_id=None, amount_cents=None, field_check=False):
+def action(
+    kind,
+    title="",
+    question="",
+    supplier_id=None,
+    amount_cents=None,
+    field_check=False,
+    report_fields=None,
+):
     return {
         "type": kind,
         "title": title,
@@ -27,6 +36,7 @@ def action(kind, title="", question="", supplier_id=None, amount_cents=None, fie
         "supplier_id": supplier_id,
         "amount_cents": amount_cents,
         "requires_field_check": field_check,
+        "report_fields": report_fields or [],
     }
 
 
@@ -43,7 +53,7 @@ def trigger(trigger_id, name, source, conditions, then, **options):
         "action": then,
         "cooldown_minutes": options.get("cooldown", 30),
         "enabled": True,
-        "created_by": "template",
+        "created_by": options.get("creator", "template"),
         "created_at": now_iso(),
         "runtime": blank_runtime(),
     }
@@ -75,7 +85,7 @@ def stock(sku, site_id, name, on_hand, minimum, reorder_to):
 def initial_state():
     return {
         "schema_version": SCHEMA_VERSION,
-        "workspace": {"name": "Averlock demo workspace"},
+        "workspace": {"name": "Averlock operations workspace"},
         "sites": [
             {
                 "id": "site-solar",
@@ -104,28 +114,67 @@ def initial_state():
         ],
         "assets": [
             asset(
-                "INV-04", "site-solar", "Inverter 04", "Inverter",
-                temperature_c=78, fan_vibration_mm_s=7.8, error_events=13,
+                "INV-04",
+                "site-solar",
+                "Inverter 04",
+                "Inverter",
+                temperature_c=78,
+                fan_vibration_mm_s=7.8,
+                error_events=13,
             ),
             asset(
-                "INV-07", "site-solar", "Inverter 07", "Inverter",
-                temperature_c=61, fan_vibration_mm_s=2.1, error_events=1,
+                "INV-07",
+                "site-solar",
+                "Inverter 07",
+                "Inverter",
+                temperature_c=61,
+                fan_vibration_mm_s=2.1,
+                error_events=1,
             ),
             asset(
-                "GEN-01", "site-tower", "Backup generator", "Generator",
-                fuel_pct=22, temperature_c=44, error_events=0,
+                "PV-01",
+                "site-solar",
+                "PV Array 01",
+                "Solar array",
+                panel_temp_c=54,
+                soiling_pct=18,
+                string_voltage_v=980,
             ),
             asset(
-                "BAT-01", "site-tower", "Battery bank", "Battery",
-                battery_pct=64, temperature_c=36, error_events=0,
+                "GEN-01",
+                "site-tower",
+                "Backup generator",
+                "Generator",
+                fuel_pct=22,
+                temperature_c=44,
+                error_events=0,
             ),
             asset(
-                "FRZ-02", "site-cold", "Freezer 02", "Freezer",
-                temperature_c=-18.4, door_open_min=2, error_events=0,
+                "BAT-01",
+                "site-tower",
+                "Battery bank",
+                "Battery",
+                battery_pct=64,
+                temperature_c=36,
+                error_events=0,
             ),
             asset(
-                "FRZ-05", "site-cold", "Freezer 05", "Freezer",
-                temperature_c=-12.6, door_open_min=14, error_events=2,
+                "FRZ-02",
+                "site-cold",
+                "Freezer 02",
+                "Freezer",
+                temperature_c=-18.4,
+                door_open_min=2,
+                error_events=0,
+            ),
+            asset(
+                "FRZ-05",
+                "site-cold",
+                "Freezer 05",
+                "Freezer",
+                temperature_c=-12.6,
+                door_open_min=14,
+                error_events=2,
             ),
         ],
         "inventory": [
@@ -210,6 +259,26 @@ def initial_state():
                     supplier_id="sup-helio",
                     amount_cents=470000,
                     field_check=True,
+                    report_fields=[
+                        {
+                            "key": "fault_indicator",
+                            "label": "Fault indicator visible?",
+                            "type": "yes_no",
+                            "required": True,
+                        },
+                        {
+                            "key": "measured_temperature",
+                            "label": "Measured casing temperature (°C)",
+                            "type": "number",
+                            "required": True,
+                        },
+                        {
+                            "key": "technician_notes",
+                            "label": "Technician findings",
+                            "type": "text",
+                            "required": False,
+                        },
+                    ],
                 ),
                 site_id="site-solar",
                 description="Propose a replacement, gated on a technician's confirmation.",
@@ -220,6 +289,79 @@ def initial_state():
                 "assets",
                 [("fuel_pct", "lt", 25)],
                 action("work_order", title="Refuel {name} at {site}"),
+            ),
+            trigger(
+                "trg-solar-array-check",
+                "PV array inspection",
+                "assets",
+                [("type", "eq", "Solar array")],
+                action(
+                    "field_check",
+                    question="Inspect {name} for soiling, cracked modules, and loose connections.",
+                    report_fields=[
+                        {
+                            "key": "module_damage",
+                            "label": "Visible module or glass damage?",
+                            "type": "yes_no",
+                            "required": True,
+                        },
+                        {
+                            "key": "soiling_pct",
+                            "label": "Estimated soiling (% of surface)",
+                            "type": "number",
+                            "required": True,
+                        },
+                        {
+                            "key": "string_voltage",
+                            "label": "String voltage reading (V)",
+                            "type": "number",
+                            "required": False,
+                        },
+                        {
+                            "key": "cleaning_notes",
+                            "label": "Cleaning or repair notes",
+                            "type": "text",
+                            "required": False,
+                        },
+                    ],
+                ),
+                mode="manual",
+                site_id="site-solar",
+                description="Runbook for recording visible panel condition and measured string voltage.",
+                creator="operator",
+            ),
+            trigger(
+                "trg-solar-soiling",
+                "High array soiling → field inspection",
+                "assets",
+                [("soiling_pct", "gte", 25)],
+                action(
+                    "field_check",
+                    question="Inspect the soiling level on {name} and record the site reading.",
+                    report_fields=[
+                        {
+                            "key": "soiling_pct",
+                            "label": "Observed soiling (%)",
+                            "type": "number",
+                            "required": True,
+                        },
+                        {
+                            "key": "cleaning_required",
+                            "label": "Cleaning required?",
+                            "type": "yes_no",
+                            "required": True,
+                        },
+                        {
+                            "key": "field_note",
+                            "label": "Field note",
+                            "type": "text",
+                            "required": False,
+                        },
+                    ],
+                ),
+                site_id="site-solar",
+                description="Dispatch a field report when array soiling crosses the service threshold.",
+                creator="operator",
             ),
             trigger(
                 "trg-freezer",
@@ -307,3 +449,38 @@ def initial_state():
             "unlock_at": None,
         },
     }
+
+
+def migrate_state(state):
+    """Upgrade the workspace without discarding operator-edited data."""
+    if state.get("schema_version", 0) >= SCHEMA_VERSION:
+        return state
+    defaults = initial_state()
+    existing_assets = {item["id"] for item in state.get("assets", [])}
+    for asset_record in defaults["assets"]:
+        if asset_record["id"] == "pv-01" and asset_record["id"] not in existing_assets:
+            state.setdefault("assets", []).append(deepcopy(asset_record))
+    existing_triggers = {item["id"] for item in state.get("triggers", [])}
+    for trigger_record in defaults["triggers"]:
+        if trigger_record["id"] not in existing_triggers and trigger_record["id"] in {
+            "trg-solar-array-check",
+            "trg-solar-soiling",
+        }:
+            state.setdefault("triggers", []).append(deepcopy(trigger_record))
+    templates = {item["id"]: item for item in defaults["triggers"]}
+    for trigger_record in state.get("triggers", []):
+        current_action = trigger_record.setdefault("action", {})
+        current_action.setdefault("assignee", "")
+        if "report_fields" not in current_action:
+            current_action["report_fields"] = deepcopy(
+                templates.get(trigger_record["id"], {}).get("action", {}).get("report_fields", [])
+            )
+    for task in state.get("field_tasks", []):
+        task.setdefault("report_fields", [])
+        task.setdefault("assignee", "")
+        task.setdefault("instructions", "")
+        task.setdefault("priority", "normal")
+    if state.get("workspace", {}).get("name") == "Averlock demo workspace":
+        state["workspace"]["name"] = "Averlock operations workspace"
+    state["schema_version"] = SCHEMA_VERSION
+    return state

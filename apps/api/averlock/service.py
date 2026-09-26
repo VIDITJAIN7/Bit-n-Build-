@@ -126,7 +126,11 @@ class OperationsService:
                 continue
             last = runtime["last_fired"].get(record_id)
             cooldown = trigger["cooldown_minutes"] * 60
-            if not manual and last and (now - datetime.fromisoformat(last)).total_seconds() < cooldown:
+            if (
+                not manual
+                and last
+                and (now - datetime.fromisoformat(last)).total_seconds() < cooldown
+            ):
                 continue
             for proposal in self.agent.propose({"state": state, "trigger": trigger, "record": row}):
                 self._admit(state, proposal, trigger)
@@ -137,9 +141,11 @@ class OperationsService:
             runtime["stats"]["fired"] += 1
         # Re-evaluate after execution: an action that resolved its condition (a completed
         # restock, say) re-arms the record immediately instead of waiting to be seen clear.
-        current = [row["id"] for row in rules.evaluate(state, trigger)] if created else [
-            row["id"] for row in rows
-        ]
+        current = (
+            [row["id"] for row in rules.evaluate(state, trigger)]
+            if created
+            else [row["id"] for row in rows]
+        )
         for record_id in list(runtime["firing"]):
             if record_id not in current:
                 del runtime["firing"][record_id]
@@ -155,7 +161,9 @@ class OperationsService:
             and a["subject"]["id"] == record_id
             for a in state["actions"]
         ) or any(
-            t["status"] == "open" and t.get("trigger_id") == trigger_id and t["subject_id"] == record_id
+            t["status"] == "open"
+            and t.get("trigger_id") == trigger_id
+            and t["subject_id"] == record_id
             for t in state["field_tasks"]
         )
 
@@ -187,7 +195,9 @@ class OperationsService:
         if outcome == "blocked":
             state["stats"]["blocked"] += 1
             reasons = "; ".join(action["policy"]["hard_blocks"])
-            record(state, "action.blocked", f"{action['title']} — {reasons}", "policy", action["id"])
+            record(
+                state, "action.blocked", f"{action['title']} — {reasons}", "policy", action["id"]
+            )
         if trigger:
             trigger["runtime"]["stats"][outcome] += 1
         if state["drills"]["enabled"] and self.random.random() < state["drills"]["rate"]:
@@ -216,7 +226,9 @@ class OperationsService:
             if item:
                 item["stock"] += action["quantity"]
                 outcome += f"; {action['quantity']} received into stock (simulated delivery)"
-        elif kind == "field_check":
+        elif kind in ("field_check", "work_order"):
+            # Work orders are worker-facing tasks too: let the agent turn the
+            # administrator's saved trigger into an assigned field job.
             action["field_task_id"] = self._open_task(state, action, actor)["id"]
         elif kind == "notify":
             state["stats"]["alerts"] += 1
@@ -231,7 +243,12 @@ class OperationsService:
 
     def _open_task(self, state, action, actor):
         subject = action["subject"]
-        question = action.get("field_question") or f"Is the reported condition visible on {subject['code']}?"
+        question = (
+            action.get("field_question")
+            or action.get("question")
+            or (action.get("title") if action["kind"] == "work_order" else None)
+            or f"Is the reported condition visible on {subject['code']}?"
+        )
         task = {
             "id": self._next_id(state, "task", "task"),
             "action_id": action["id"],
@@ -241,6 +258,10 @@ class OperationsService:
             "subject_code": subject["code"],
             "subject_label": subject["label"],
             "question": question,
+            "instructions": action.get("title", ""),
+            "assignee": action.get("assignee", ""),
+            "priority": action.get("priority", "normal"),
+            "report_fields": action.get("report_fields", []),
             "gates_decision": action["kind"] == "purchase",
             "status": "open",
             "created_at": now_iso(),
@@ -330,6 +351,7 @@ class OperationsService:
             if changed:
                 # New logic starts from a clean slate; open items and cooldowns still apply.
                 trigger["runtime"]["firing"] = {}
+            self._sync_open_field_tasks(state, trigger)
             record(
                 state,
                 "trigger.updated",
@@ -339,6 +361,51 @@ class OperationsService:
             return f"“{trigger['name']}” saved."
 
         return self.repository.mutate(change)
+
+    @staticmethod
+    def _sync_open_field_tasks(state, trigger):
+        """Keep active worker forms aligned with edits to their task definition.
+
+        Completed tasks and reports remain historical records. Tasks whose source record
+        disappeared or changed data source also retain their original assignment.
+        """
+        action = trigger["action"]
+        kind = action["type"]
+        has_worker_task = kind in ("field_check", "work_order") or (
+            kind == "purchase" and action.get("requires_field_check", False)
+        )
+        if not has_worker_task:
+            return
+        rows = {
+            row["id"]: row
+            for row in rules.records(state, trigger["source"], trigger["site_id"])
+        }
+        sites = {site["id"]: site for site in state["sites"]}
+        for task in state["field_tasks"]:
+            if task.get("trigger_id") != trigger["id"] or task["status"] != "open":
+                continue
+            row = rows.get(task["subject_id"])
+            if not row:
+                continue
+            site = sites.get(row["site_id"], {})
+            old_fields = task.get("report_fields", [])
+            new_fields = action.get("report_fields", [])
+            history = task.setdefault("report_fields_history", [])
+            if old_fields != new_fields and old_fields not in history:
+                history.append([dict(field) for field in old_fields])
+            if kind == "field_check":
+                task["question"] = rules.render(action["question"], row)
+            elif kind == "work_order":
+                task["question"] = rules.render(action["title"] or "Inspect {name}", row)
+            else:
+                task["question"] = rules.render(action["question"], row)
+            task["site_id"] = row["site_id"]
+            task["subject_code"] = row.get("code", task["subject_code"])
+            task["subject_label"] = row.get("name", task["subject_label"])
+            task["assignee"] = action.get("assignee") or site.get("technician", "")
+            task["priority"] = action.get("priority", "normal")
+            task["report_fields"] = [dict(field) for field in action.get("report_fields", [])]
+            task["gates_decision"] = kind == "purchase"
 
     def set_trigger_enabled(self, trigger_id, enabled):
         def change(state):
@@ -375,7 +442,9 @@ class OperationsService:
             self._trim(state)
             if not created:
                 return f"“{trigger['name']}” ran. Nothing new: no match, or items already open."
-            return f"“{trigger['name']}” ran: {plural(created, 'new action')} through the policy gate."
+            return (
+                f"“{trigger['name']}” ran: {plural(created, 'new action')} through the policy gate."
+            )
 
         return self.repository.mutate(change)
 
@@ -435,7 +504,11 @@ class OperationsService:
                 title = f"{data['name']} ({sku})"
             else:
                 catalog = {sku.upper(): price for sku, price in data["catalog"].items()}
-                item = {**data, "id": unique_id(items, "sup-" + slug(data["name"])), "catalog": catalog}
+                item = {
+                    **data,
+                    "id": unique_id(items, "sup-" + slug(data["name"])),
+                    "catalog": catalog,
+                }
                 title = data["name"]
             items.append(item)
             record(state, "data.created", f"{NOUNS[collection]} {title} added", "operator")
@@ -461,7 +534,11 @@ class OperationsService:
                         elif old != new:
                             item["metrics"][metric] = new
                             baselines[metric] = new
-                            changes.append(f"{metric} {old} → {new}" if old is not None else f"{metric} = {new}")
+                            changes.append(
+                                f"{metric} {old} → {new}"
+                                if old is not None
+                                else f"{metric} = {new}"
+                            )
                 elif key == "catalog":
                     for sku, price in value.items():
                         sku = sku.upper()
@@ -609,7 +686,9 @@ class OperationsService:
                     "bytes": len(item["data_url"].split(",", 1)[-1]) * 3 // 4,
                 }
             )
-            blobs.append((f"{report['id']}:{item['kind']}", report["id"], item["kind"], item["data_url"]))
+            blobs.append(
+                (f"{report['id']}:{item['kind']}", report["id"], item["kind"], item["data_url"])
+            )
         entry = {**report, "attachments": attachments}
 
         def change(state):
@@ -627,6 +706,52 @@ class OperationsService:
                 raise DomainError(
                     f"Match {task['subject_code']} and complete all compliance observations"
                 )
+            responses = report.get("responses", {})
+            schemas = [task.get("report_fields", []), *task.get("report_fields_history", [])]
+            valid_schema = False
+            unknown_fields = True
+            missing_labels = []
+            invalid_labels = []
+            for schema in schemas:
+                definitions = {field["key"]: field for field in schema}
+                if set(responses) - set(definitions):
+                    continue
+                unknown_fields = False
+                missing = []
+                invalid = []
+                for key, definition in definitions.items():
+                    value = responses.get(key)
+                    if definition["required"] and (value is None or value == ""):
+                        missing.append(definition["label"])
+                        continue
+                    if value is None:
+                        continue
+                    valid_type = (
+                        isinstance(value, str) and len(value) <= 500
+                        if definition["type"] == "text"
+                        else isinstance(value, bool)
+                        if definition["type"] == "yes_no"
+                        else isinstance(value, (int, float)) and not isinstance(value, bool)
+                    )
+                    if not valid_type:
+                        invalid.append(definition["label"])
+                if not missing and not invalid:
+                    valid_schema = True
+                    break
+                if not missing:
+                    missing_labels = []
+                elif not missing_labels:
+                    missing_labels = missing
+                if not invalid:
+                    invalid_labels = []
+                elif not invalid_labels:
+                    invalid_labels = invalid
+            if not valid_schema and unknown_fields:
+                raise DomainError("This report contains fields that were not requested")
+            if not valid_schema and missing_labels:
+                raise DomainError(f"Complete the required field: {missing_labels[0]}")
+            if not valid_schema and invalid_labels:
+                raise DomainError(f"Use the requested response type for: {invalid_labels[0]}")
             kinds = [a["kind"] for a in report["attachments"]]
             if "photo" not in kinds:
                 raise DomainError("Attach a photo or the clearly labeled demo evidence fixture")
@@ -637,7 +762,9 @@ class OperationsService:
                 for a in report["attachments"]
             ):
                 raise DomainError("Attachment type does not match its content type")
-            state["reports"].append({**entry, "action_id": task["action_id"], "confirmed_at": now_iso()})
+            state["reports"].append(
+                {**entry, "action_id": task["action_id"], "confirmed_at": now_iso()}
+            )
             task.update(
                 status="answered",
                 answer=report["answer"],
@@ -850,4 +977,5 @@ class OperationsService:
             trigger["runtime"]["matches"] = [row["id"] for row in rules.evaluate(state, trigger)]
         state["schema"] = rules.schema(state)
         state["agent"]["interval_seconds"] = self.interval
+        state["agent"]["planner"] = getattr(self.agent, "mode", "rules")
         return state

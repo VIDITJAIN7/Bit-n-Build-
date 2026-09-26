@@ -17,7 +17,6 @@ import {
 import { money } from "./api";
 import type {
   ActionType,
-  Condition,
   FieldType,
   MetricValue,
   Op,
@@ -54,7 +53,7 @@ export const ACTIONS: Record<
     short: "Alert",
     icon: Bell,
     description:
-      "Flag the record on the control panel and in the activity log. Nothing is spent.",
+      "Flag the record in the overview and activity log. Nothing is spent.",
   },
   work_order: {
     label: "Create a work order",
@@ -75,7 +74,7 @@ export const ACTIONS: Record<
     short: "Field check",
     icon: ClipboardCheck,
     description:
-      "Send a yes/no question to the field console. The technician answers on site with photo evidence.",
+      "Assign a yes/no field task. The worker records the result with photo evidence.",
   },
   purchase: {
     label: "Propose a purchase",
@@ -105,6 +104,8 @@ export const emptyAction = (type: ActionType = "notify") => ({
   supplier_id: null,
   amount_cents: null,
   requires_field_check: false,
+  report_fields: [],
+  assignee: "",
 });
 
 export const blankDraft = (source: Source = "assets"): TriggerDraft => ({
@@ -119,120 +120,6 @@ export const blankDraft = (source: Source = "assets"): TriggerDraft => ({
   cooldown_minutes: 30,
   enabled: true,
 });
-
-const template = (
-  source: Source,
-  conditions: Condition[],
-  action: Partial<TriggerDraft["action"]> & { type: ActionType },
-  extra: Partial<TriggerDraft> = {},
-): TriggerDraft => ({
-  ...blankDraft(source),
-  conditions,
-  action: { ...emptyAction(action.type), ...action },
-  ...extra,
-});
-
-export const TEMPLATES: {
-  id: string;
-  name: string;
-  tag: string;
-  description: string;
-  draft: (state: State) => TriggerDraft;
-}[] = [
-  {
-    id: "restock",
-    name: "Low stock → restock",
-    tag: "Any industry",
-    description: "Reorder consumables when they fall below minimum.",
-    draft: () =>
-      template(
-        "inventory",
-        [{ field: "shortfall", op: "gt", value: 0 }],
-        { type: "restock" },
-        { name: "Restock critical spares", cooldown_minutes: 10 },
-      ),
-  },
-  {
-    id: "overheat",
-    name: "Too hot → work order",
-    tag: "Energy · plants",
-    description: "Send a technician before heat damages equipment.",
-    draft: () =>
-      template(
-        "assets",
-        [{ field: "temperature_c", op: "gt", value: 75 }],
-        { type: "work_order", title: "Inspect cooling on {name}" },
-        { name: "Equipment running hot" },
-      ),
-  },
-  {
-    id: "battery",
-    name: "Battery low → field check",
-    tag: "Telecom · fleets",
-    description: "Ask the technician to confirm charging on site.",
-    draft: () =>
-      template(
-        "assets",
-        [{ field: "battery_pct", op: "lt", value: 40 }],
-        {
-          type: "field_check",
-          question: "Is {code} charging from mains or the generator?",
-        },
-        { name: "Backup battery draining" },
-      ),
-  },
-  {
-    id: "door",
-    name: "Door open → alert",
-    tag: "Cold chain · retail",
-    description: "Surface doors left open before stock spoils.",
-    draft: () =>
-      template(
-        "assets",
-        [{ field: "door_open_min", op: "gt", value: 5 }],
-        { type: "notify", title: "{name}: door open at {site}" },
-        { name: "Door open too long", cooldown_minutes: 15 },
-      ),
-  },
-  {
-    id: "replace",
-    name: "Faults → gated replacement",
-    tag: "Any industry",
-    description:
-      "Propose a replacement that needs a technician's confirmation first.",
-    draft: (state) =>
-      template(
-        "assets",
-        [{ field: "error_events", op: "gte", value: 5 }],
-        {
-          type: "purchase",
-          title: "Replace {name}",
-          supplier_id: state.suppliers[0]?.id ?? null,
-          amount_cents: 120000,
-          requires_field_check: true,
-          question: "Is the fault indicator on {code} active?",
-        },
-        { name: "Recurring faults need replacement" },
-      ),
-  },
-  {
-    id: "runbook",
-    name: "Manual runbook",
-    tag: "Button on the panel",
-    description: "Send the same check to every asset at a site on demand.",
-    draft: (state) =>
-      template(
-        "assets",
-        [],
-        { type: "field_check", question: "Is {code} undamaged and secure?" },
-        {
-          name: "Post-storm inspection",
-          mode: "manual",
-          site_id: state.sites[0]?.id ?? "all",
-        },
-      ),
-  },
-];
 
 export function fieldFor(state: State, source: Source, key: string) {
   return state.schema[source].find((field) => field.key === key);
@@ -341,8 +228,13 @@ export function draftOf(trigger: Trigger): TriggerDraft {
     mode: trigger.mode,
     match: trigger.match,
     conditions: trigger.conditions.map((condition) => ({ ...condition })),
-    action: { ...trigger.action },
+    action: {
+      ...trigger.action,
+      report_fields: trigger.action.report_fields ?? [],
+      assignee: trigger.action.assignee ?? "",
+    },
     cooldown_minutes: trigger.cooldown_minutes,
     enabled: trigger.enabled,
   };
 }
+
